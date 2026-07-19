@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 const [, , repositoryArg] = process.argv;
@@ -67,17 +67,19 @@ try {
   process.exit(1);
 }
 
+await rm(outputDir, { force: true, recursive: true });
 await mkdir(outputDir, { recursive: true });
 
 const installerName = basename(installerPath);
-const signatureName = basename(signaturePath);
-const installerOutputPath = join(outputDir, installerName);
+const releaseInstallerName = installerName.replace(/\s+/g, "-");
+const signatureName = `${releaseInstallerName}.sig`;
+const installerOutputPath = join(outputDir, releaseInstallerName);
 const signatureOutputPath = join(outputDir, signatureName);
 
 await copyFile(installerPath, installerOutputPath);
 await copyFile(signaturePath, signatureOutputPath);
 
-const encodedInstallerName = encodeURIComponent(installerName);
+const encodedInstallerName = encodeURIComponent(releaseInstallerName);
 const latest = {
   version,
   notes: `MpBPO PDF Studio ${version}`,
@@ -105,7 +107,7 @@ const appPolicy = {
 
 await writeFile(join(outputDir, "app-policy.json"), `${JSON.stringify(appPolicy, null, 2)}\n`, "utf8");
 
-console.log(`Prepared ${installerName}`);
+console.log(`Prepared ${releaseInstallerName}`);
 console.log(`Prepared ${signatureName}`);
 console.log("Prepared latest.json");
 console.log("Prepared app-policy.json");
