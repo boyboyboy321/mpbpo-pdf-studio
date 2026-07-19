@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-release/
+src-tauri/target/
+src-tauri/target-*/
+.agents/
+.codex/
+*.tsbuildinfo
+.codex-tauri-dev.log
+*.log
+*.tmp
+*.bak
+.DS_Store
