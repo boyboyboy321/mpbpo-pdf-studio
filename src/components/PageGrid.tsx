@@ -13,7 +13,7 @@ import {
 } from "@dnd-kit/core";
 import { restrictToWindowEdges } from "@dnd-kit/modifiers";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Brush, Maximize2, RotateCw, Scissors, Trash2 } from "lucide-react";
+import { Bookmark, Maximize2, RotateCw, Scissors, Trash2 } from "lucide-react";
 import {
   memo,
   startTransition,
@@ -61,7 +61,6 @@ interface PageGridProps {
   onHover: (page: PdfPage, point: { x: number; y: number }, preview: PdfPagePreview | null) => void;
   onHoverEnd: () => void;
   onOpenFullPreview: (page: PdfPage) => void;
-  onOpenPaintPreview: (page: PdfPage) => void;
   onPageEdited: () => void;
   onRequestDeletePage: (pageNumber: number) => void;
   pausePreviewLoading: boolean;
@@ -74,7 +73,6 @@ export const PageGrid = memo(function PageGrid({
   onHover,
   onHoverEnd,
   onOpenFullPreview,
-  onOpenPaintPreview,
   onPageEdited,
   onRequestDeletePage,
   onSmallPreviewComplete,
@@ -441,7 +439,6 @@ export const PageGrid = memo(function PageGrid({
                       onHover={onHover}
                       onHoverEnd={onHoverEnd}
                       onOpenFullPreview={onOpenFullPreview}
-                      onOpenPaintPreview={onOpenPaintPreview}
                       onPageEdited={onPageEdited}
                       onRequestDeletePage={onRequestDeletePage}
                       page={page}
@@ -482,7 +479,6 @@ interface PageSlotProps {
   onHover: (page: PdfPage, point: { x: number; y: number }, preview: PdfPagePreview | null) => void;
   onHoverEnd: () => void;
   onOpenFullPreview: (page: PdfPage) => void;
-  onOpenPaintPreview: (page: PdfPage) => void;
   onPageEdited: () => void;
   onRequestDeletePage: (pageNumber: number) => void;
   page: PdfPage;
@@ -504,7 +500,6 @@ const PageSlot = memo(function PageSlot({
   onHover,
   onHoverEnd,
   onOpenFullPreview,
-  onOpenPaintPreview,
   onPageEdited,
   onRequestDeletePage,
   previewEntry,
@@ -529,9 +524,9 @@ const PageSlot = memo(function PageSlot({
     onOpenFullPreview(page);
   }
 
-  function handleOpenPaintPreviewClick(event: MouseEvent<HTMLButtonElement>) {
+  function handleToggleMarkClick(event: MouseEvent<HTMLButtonElement>) {
     event.stopPropagation();
-    onOpenPaintPreview(page);
+    dispatch({ type: "toggle-page-mark", pageNumber: page.pageNumber });
   }
 
   function handleRotateRightClick(event: MouseEvent<HTMLButtonElement>) {
@@ -561,7 +556,7 @@ const PageSlot = memo(function PageSlot({
       <span className="page-drop-indicator is-after" aria-hidden="true" />
       <div
         ref={setDraggableNodeRef}
-        className={`page-card ${isSelected ? "is-selected" : ""} ${isDragMoving ? "is-drag-moving" : ""}`}
+        className={`page-card ${isSelected ? "is-selected" : ""} ${page.tinted ? "is-marked" : ""} ${isDragMoving ? "is-drag-moving" : ""}`}
         onMouseLeave={hoverEnabled ? onHoverEnd : undefined}
         onMouseMove={
           hoverEnabled
@@ -579,7 +574,7 @@ const PageSlot = memo(function PageSlot({
           <button
             type="button"
             aria-label={`Open page ${page.pageNumber} preview`}
-            title="Preview"
+            title="Preview (Space)"
             onClick={handleOpenFullPreviewClick}
             onPointerDown={(event) => event.stopPropagation()}
           >
@@ -588,26 +583,27 @@ const PageSlot = memo(function PageSlot({
           <button
             type="button"
             aria-label={`Rotate page ${page.pageNumber} right`}
-            title="Rotate right"
+            title="Rotate right (Ctrl+R)"
             onClick={handleRotateRightClick}
             onPointerDown={(event) => event.stopPropagation()}
           >
             <RotateCw size={17} />
           </button>
           <button
+            className={page.tinted ? "is-marked" : ""}
             type="button"
-            aria-label={`Paint page ${page.pageNumber}`}
-            title="Paint"
-            onClick={handleOpenPaintPreviewClick}
+            aria-label={page.tinted ? `Unmark page ${page.pageNumber}` : `Mark page ${page.pageNumber}`}
+            title={page.tinted ? "Unmark (Ctrl+M)" : "Mark (Ctrl+M)"}
+            onClick={handleToggleMarkClick}
             onPointerDown={(event) => event.stopPropagation()}
           >
-            <Brush size={17} />
+            <Bookmark size={17} />
           </button>
           <button
             className="is-danger"
             type="button"
             aria-label={`Delete page ${page.pageNumber}`}
-            title="Delete"
+            title="Delete (Delete)"
             onClick={handleDeletePageClick}
             onPointerDown={(event) => event.stopPropagation()}
           >

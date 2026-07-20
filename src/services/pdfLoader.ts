@@ -1,7 +1,17 @@
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
-import type { InsertPageMetadata, PdfDocument, PdfMetadata, PdfPage, PdfPagePaintEdit, PdfPagePreview, PdfPageSource, SplitResult } from "../domain/pdf";
+import type {
+  InsertPageMetadata,
+  PdfDocument,
+  PdfMetadata,
+  PdfPage,
+  PdfPagePaintEdit,
+  PdfPagePreview,
+  PdfPageSource,
+  SplitOutputOptions,
+  SplitResult,
+} from "../domain/pdf";
 import { createDocumentFromMetadata } from "../utils/demoPages";
 
 export async function pickPdfFilePath(): Promise<string | null> {
@@ -34,6 +44,20 @@ export async function pickInsertFilePaths(): Promise<string[]> {
   }
 
   return Array.isArray(selected) ? selected : [];
+}
+
+export async function pickSplitOutputFolderPath(): Promise<string | null> {
+  if (!isTauri()) {
+    return null;
+  }
+
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose split output folder",
+  });
+
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function loadPdfDocumentFromPath(path: string): Promise<PdfDocument> {
@@ -142,17 +166,23 @@ export async function renderDocumentPages(
   return previews;
 }
 
-export async function splitPdfFile(path: string, cutBeforePages: number[], runId: string): Promise<SplitResult> {
-  return invoke<SplitResult>("split_pdf", { path, cutBeforePages, runId });
+export async function splitPdfFile(path: string, cutBeforePages: number[], runId: string, outputOptions: SplitOutputOptions): Promise<SplitResult> {
+  return invoke<SplitResult>("split_pdf", { path, cutBeforePages, outputOptions, runId });
 }
 
-export async function splitPdfDocument(document: PdfDocument, cutBeforePages: number[], runId: string): Promise<SplitResult> {
+export async function splitPdfDocument(
+  document: PdfDocument,
+  cutBeforePages: number[],
+  runId: string,
+  outputOptions: SplitOutputOptions,
+): Promise<SplitResult> {
   if (!document.filePath) {
     throw new Error("Open a real PDF before splitting.");
   }
 
   return invoke<SplitResult>("split_pdf_with_edits", {
     cutBeforePages,
+    outputOptions,
     pages: createEditPagePlans(document),
     path: document.filePath,
     runId,

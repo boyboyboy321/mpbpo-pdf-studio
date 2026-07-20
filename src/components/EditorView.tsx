@@ -3,9 +3,10 @@ import {
   AlignCenter,
   AlignLeft,
   AlignRight,
-  Brush,
+  Bookmark,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -46,7 +47,17 @@ import {
   type WheelEvent as ReactWheelEvent,
 } from "react";
 
-import type { PdfDocument, PdfLoadState, PdfPage, PdfPagePaintEdit, PdfPagePreview, PdfTextAlign, SplitProgressEvent, SplitResult } from "../domain/pdf";
+import type {
+  PdfDocument,
+  PdfLoadState,
+  PdfPage,
+  PdfPagePaintEdit,
+  PdfPagePreview,
+  PdfTextAlign,
+  SplitOutputMode,
+  SplitProgressEvent,
+  SplitResult,
+} from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import {
   getRenderQualitySettings,
@@ -60,11 +71,13 @@ import {
   getFriendlyLoadError,
   openOutputFolder,
   pickInsertFilePaths,
+  pickSplitOutputFolderPath,
   readInsertPages,
   renderDocumentPages,
   savePdfEdits,
   splitPdfDocument,
 } from "../services/pdfLoader";
+import { saveDocumentPageMarks } from "../services/pageMarks";
 import type { DocumentAction } from "../state/documentReducer";
 import { formatBytes } from "../utils/format";
 
@@ -155,10 +168,34 @@ const DETAIL_BACKGROUND_BATCH_SIZE = 1;
 const DETAIL_IDLE_DELAY_MS = 35;
 const RENDER_QUALITY_OPTIONS = Object.entries(RENDER_QUALITY_PRESETS) as Array<[RenderQualityPreset, (typeof RENDER_QUALITY_PRESETS)[RenderQualityPreset]]>;
 const FIXED_RENDER_QUALITY_OPTIONS = RENDER_QUALITY_OPTIONS.filter(([presetId]) => presetId !== "custom");
+const SPLIT_OUTPUT_OPTIONS: Record<SplitOutputMode, { description: string; label: string; mode: SplitOutputMode }> = {
+  siblingFolder: {
+    description: "Create a timestamped _split folder.",
+    label: "Folder beside original",
+    mode: "siblingFolder",
+  },
+  originalFolderDeleteOriginal: {
+    description: "Split beside the PDF, then remove source.",
+    label: "Beside original, delete source",
+    mode: "originalFolderDeleteOriginal",
+  },
+  customFolder: {
+    description: "Pick a destination folder.",
+    label: "Choose folder",
+    mode: "customFolder",
+  },
+};
+const SPLIT_OUTPUT_OPTION_LIST = Object.values(SPLIT_OUTPUT_OPTIONS);
+
+function getSplitOutputOption(mode: SplitOutputMode) {
+  return SPLIT_OUTPUT_OPTIONS[mode];
+}
 
 export function EditorView({ document, dispatch, isFileDragging, loadState, onPickPdf }: EditorViewProps) {
   const hoverFrameRef = useRef<number | null>(null);
   const eachPageSplitCheckboxRef = useRef<HTMLInputElement | null>(null);
+  const splitLocationMenuRef = useRef<HTMLDivElement | null>(null);
+  const splitRunningRef = useRef(false);
   const pendingHoverRef = useRef<HoverState | null>(null);
   const detailFailedPagesRef = useRef<Set<string>>(new Set());
   const detailPreviewsRef = useRef<Record<string, PdfPagePreview>>({});
@@ -174,6 +211,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
   const [deleteConfirmation, setDeleteConfirmation] = useState<{ pageNumbers: number[] } | null>(null);
   const [closeConfirmationOpen, setCloseConfirmationOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [splitLocationMenuOpen, setSplitLocationMenuOpen] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
   const [splitState, setSplitState] = useState<SplitState>({ status: "idle" });
 
@@ -181,6 +219,10 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
     () => getRenderQualitySettings(document.renderQualityPreset, document.customRenderQuality),
     [document.customRenderQuality, document.renderQualityPreset],
   );
+  const selectedPagesMarked = useMemo(() => {
+    const selectedPages = document.pages.filter((page) => document.selectedPages.has(page.pageNumber));
+    return selectedPages.length > 0 && selectedPages.every((page) => page.tinted);
+  }, [document.pages, document.selectedPages]);
   const renderQualitySignature = `${renderQuality.smallWidth}:${renderQuality.smallJpegQuality}:${renderQuality.detailWidth}:${renderQuality.detailJpegQuality}`;
   const pageCacheSignature = useMemo(() => document.pages.map((page) => page.id).join("|"), [document.pages]);
   const sortedCuts = useMemo(() => [...document.cutBeforePages].sort((a, b) => a - b), [document.cutBeforePages]);
@@ -188,6 +230,11 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
   const isEachPageSplit = totalPossibleCuts > 0 && sortedCuts.length === totalPossibleCuts;
   const isPartialEachPageSplit = sortedCuts.length > 0 && !isEachPageSplit;
   const canSplit = Boolean(document.filePath) && sortedCuts.length > 0 && splitState.status !== "running";
+  const splitOutputOption = getSplitOutputOption(document.splitOutputMode);
+  const splitOutputDescription =
+    document.splitOutputMode === "customFolder" && document.splitCustomOutputFolder
+      ? compactPath(document.splitCustomOutputFolder)
+      : splitOutputOption.description;
 
   useEffect(() => {
     return () => {
@@ -198,10 +245,48 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
   }, []);
 
   useEffect(() => {
+    saveDocumentPageMarks(document);
+  }, [document.filePath, document.pages]);
+
+  useEffect(() => {
     if (eachPageSplitCheckboxRef.current) {
       eachPageSplitCheckboxRef.current.indeterminate = isPartialEachPageSplit;
     }
   }, [isPartialEachPageSplit]);
+
+  useEffect(() => {
+    splitRunningRef.current = splitState.status === "running";
+
+    if (splitState.status === "running") {
+      setSplitLocationMenuOpen(false);
+    }
+  }, [splitState.status]);
+
+  useEffect(() => {
+    if (!splitLocationMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (splitLocationMenuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+
+      setSplitLocationMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSplitLocationMenuOpen(false);
+      }
+    };
+
+    window.document.addEventListener("pointerdown", handlePointerDown);
+    window.document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.document.removeEventListener("pointerdown", handlePointerDown);
+      window.document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [splitLocationMenuOpen]);
 
   useEffect(() => {
     let isDisposed = false;
@@ -299,6 +384,12 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       let nextBackgroundPage = 1;
 
       while (!isCancelled && detailRunRef.current === runId) {
+        if (splitRunningRef.current) {
+          setDetailPriorityActive(false);
+          await sleep(DETAIL_IDLE_DELAY_MS);
+          continue;
+        }
+
         const priorityPageNumber = detailPriorityQueueRef.current.shift();
         const pageNumbers: number[] = [];
 
@@ -479,13 +570,6 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
     [openFullPreviewPage],
   );
 
-  const handleOpenPaintPreview = useCallback(
-    (page: PdfPage) => {
-      openFullPreviewPage(page.pageNumber, "cover");
-    },
-    [openFullPreviewPage],
-  );
-
   const handleRotateFullPreview = useCallback(
     (pageNumber: number) => {
       dispatch({ type: "rotate-page", pageNumber, degrees: 90 });
@@ -654,6 +738,28 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
         return;
       }
 
+      if (fullPreview || settingsOpen || deleteConfirmation || closeConfirmationOpen) {
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        openFullPreviewPage(document.lastSelectedPageNumber);
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r") {
+        event.preventDefault();
+        handleRotateSelected(90);
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        dispatch({ type: "toggle-selected-page-marks" });
+        return;
+      }
+
       if (event.key === "Delete") {
         event.preventDefault();
         handleDeleteSelectedPages();
@@ -742,6 +848,60 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
     setDeleteConfirmation(null);
   }
 
+  async function resolveSplitOutputOptions() {
+    if (document.splitOutputMode !== "customFolder") {
+      return {
+        customFolderPath: document.splitCustomOutputFolder,
+        mode: document.splitOutputMode,
+      };
+    }
+
+    if (document.splitCustomOutputFolder) {
+      return {
+        customFolderPath: document.splitCustomOutputFolder,
+        mode: document.splitOutputMode,
+      };
+    }
+
+    const folder = await pickSplitOutputFolderPath();
+    if (!folder) {
+      return null;
+    }
+
+    dispatch({ type: "set-split-custom-output-folder", folder });
+    return {
+      customFolderPath: folder,
+      mode: document.splitOutputMode,
+    };
+  }
+
+  async function handleSelectSplitOutputMode(mode: SplitOutputMode) {
+    if (mode !== "customFolder") {
+      dispatch({ type: "set-split-output-mode", mode });
+      setSplitLocationMenuOpen(false);
+      return;
+    }
+
+    const folder = document.splitCustomOutputFolder ?? (await pickSplitOutputFolderPath());
+    setSplitLocationMenuOpen(false);
+    if (!folder) {
+      return;
+    }
+
+    dispatch({ type: "set-split-output-mode", mode });
+    dispatch({ type: "set-split-custom-output-folder", folder });
+  }
+
+  async function handleChooseSplitOutputFolder() {
+    const folder = await pickSplitOutputFolderPath();
+    if (!folder) {
+      return;
+    }
+
+    dispatch({ type: "set-split-output-mode", mode: "customFolder" });
+    dispatch({ type: "set-split-custom-output-folder", folder });
+  }
+
   async function handleSplit() {
     if (!document.filePath) {
       setSplitState({ status: "error", message: "Open a real PDF before splitting. Demo files cannot be exported." });
@@ -753,11 +913,16 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       return;
     }
 
+    const outputOptions = await resolveSplitOutputOptions();
+    if (!outputOptions) {
+      return;
+    }
+
     const runId = createSplitRunId();
     setSplitState({ status: "running", completedFiles: 0, runId, totalFiles: sortedCuts.length + 1 });
 
     try {
-      const result = await splitPdfDocument(document, sortedCuts, runId);
+      const result = await splitPdfDocument(document, sortedCuts, runId, outputOptions);
       setSplitState({ status: "success", result });
     } catch (error) {
       setSplitState({ status: "error", message: getFriendlyLoadError(error) });
@@ -804,26 +969,25 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
           >
             <Search size={19} />
           </button>
-          <button className="rail-tool" type="button" aria-label="Rotate left" onClick={() => handleRotateSelected(270)}>
+          <button className="rail-tool" type="button" aria-label="Rotate left" title="Rotate selected left" onClick={() => handleRotateSelected(270)}>
             <RotateCcw size={19} />
           </button>
-          <button className="rail-tool" type="button" aria-label="Rotate right" onClick={() => handleRotateSelected(90)}>
+          <button className="rail-tool" type="button" aria-label="Rotate right" title="Rotate selected right (Ctrl+R)" onClick={() => handleRotateSelected(90)}>
             <RotateCw size={19} />
           </button>
-          <button className="rail-tool" type="button" aria-label="Insert pages" onClick={() => void handleInsertPages()}>
+          <button className="rail-tool" type="button" aria-label="Insert pages" title="Insert pages" onClick={() => void handleInsertPages()}>
             <FilePlus2 size={19} />
           </button>
           <button
-            className="rail-tool"
+            className={`rail-tool ${selectedPagesMarked ? "is-active is-marked" : ""}`}
             type="button"
-            aria-label="Paint selected page"
-            onClick={() => {
-              openFullPreviewPage(document.lastSelectedPageNumber, "cover");
-            }}
+            aria-label={selectedPagesMarked ? "Unmark selected pages" : "Mark selected pages"}
+            title={selectedPagesMarked ? "Unmark selected (Ctrl+M)" : "Mark selected (Ctrl+M)"}
+            onClick={() => dispatch({ type: "toggle-selected-page-marks" })}
           >
-            <Brush size={19} />
+            <Bookmark size={19} />
           </button>
-          <button className="rail-tool danger" type="button" aria-label="Delete selected pages" onClick={handleDeleteSelectedPages}>
+          <button className="rail-tool danger" type="button" aria-label="Delete selected pages" title="Delete selected (Delete)" onClick={handleDeleteSelectedPages}>
             <Trash2 size={19} />
           </button>
         </aside>
@@ -858,12 +1022,11 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
             dispatch={dispatch}
             onSmallPreviewComplete={handleSmallPreviewComplete}
             onOpenFullPreview={handleOpenFullPreview}
-            onOpenPaintPreview={handleOpenPaintPreview}
             onHover={handlePageHover}
             onHoverEnd={handlePageHoverEnd}
             onPageEdited={handlePageEdited}
             onRequestDeletePage={(pageNumber) => requestDeletePages([pageNumber])}
-            pausePreviewLoading={detailPriorityActive}
+            pausePreviewLoading={detailPriorityActive || splitState.status === "running"}
             renderQuality={renderQuality}
           />
 
@@ -939,12 +1102,71 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
             <section className="panel-block">
               <h2>Output</h2>
               <Metric label="Files planned" value={sortedCuts.length + 1} />
+              <div className="split-location-control">
+                <label id="split-output-mode-label">Files location</label>
+                <div
+                  ref={splitLocationMenuRef}
+                  className={`split-location-picker ${splitLocationMenuOpen ? "is-open" : ""}`}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      setSplitLocationMenuOpen(false);
+                    }
+                  }}
+                >
+                  <button
+                    className="split-location-trigger"
+                    type="button"
+                    aria-expanded={splitLocationMenuOpen}
+                    aria-haspopup="menu"
+                    aria-labelledby="split-output-mode-label"
+                    disabled={splitState.status === "running"}
+                    onClick={() => setSplitLocationMenuOpen((isOpen) => !isOpen)}
+                  >
+                    <span className="split-location-icon">
+                      <FolderOpen size={18} />
+                    </span>
+                    <span className="split-location-copy">
+                      <strong>{splitOutputOption.label}</strong>
+                      <small>{splitOutputDescription}</small>
+                    </span>
+                    <ChevronDown size={17} />
+                  </button>
+                  {splitLocationMenuOpen ? (
+                    <div className="split-location-menu" role="menu" aria-label="Files location">
+                      {SPLIT_OUTPUT_OPTION_LIST.map((option) => (
+                        <button
+                          key={option.mode}
+                          className={option.mode === document.splitOutputMode ? "is-active" : ""}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={option.mode === document.splitOutputMode}
+                          onClick={() => void handleSelectSplitOutputMode(option.mode)}
+                        >
+                          <span>
+                            <strong>{option.label}</strong>
+                            <small>{option.description}</small>
+                          </span>
+                          {option.mode === document.splitOutputMode ? <Check size={16} /> : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+                {document.splitOutputMode === "customFolder" ? (
+                  <button
+                    className="split-location-folder"
+                    type="button"
+                    disabled={splitState.status === "running"}
+                    title={document.splitCustomOutputFolder ?? "Choose output folder"}
+                    onClick={() => void handleChooseSplitOutputFolder()}
+                  >
+                    {document.splitCustomOutputFolder ? compactPath(document.splitCustomOutputFolder) : "Choose output folder"}
+                  </button>
+                ) : null}
+              </div>
               <button className="primary-action full" type="button" disabled={!canSplit} onClick={handleSplit}>
                 <Scissors size={18} />
                 {splitState.status === "running" ? "Splitting..." : "Split PDF"}
-              </button>
-              <button className="secondary-action full" type="button">
-                Save copy
               </button>
             </section>
           </aside>
@@ -1232,6 +1454,7 @@ function SplitToast({
           <span>
             {state.result.files.length} files split successfully - {formatBytes(totalSize)}
           </span>
+          {state.result.sourceDeleteError ? <small className="split-toast-warning">Original was not deleted: {state.result.sourceDeleteError}</small> : null}
           <button className="toast-link" type="button" onClick={() => void onOpenOutputDir(state.result.outputDir)}>
             Open in folder
           </button>
@@ -1320,6 +1543,15 @@ function Metric({ label, value }: { label: string; value: number }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function compactPath(path: string): string {
+  const maxLength = 42;
+  if (path.length <= maxLength) {
+    return path;
+  }
+
+  return `...${path.slice(-maxLength)}`;
 }
 
 function DeleteConfirmDialog({ count, onCancel, onConfirm }: { count: number; onCancel: () => void; onConfirm: () => void }) {
@@ -2879,7 +3111,8 @@ function PaintEditsLayer({
                 }}
                 onChange={(event) => onTextChange(edit, event.currentTarget.value)}
                 onKeyDown={(event) => {
-                  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+                  const shortcutKey = event.key.toLowerCase();
+                  if ((event.ctrlKey || event.metaKey) && (shortcutKey === "z" || shortcutKey === "s")) {
                     return;
                   }
 

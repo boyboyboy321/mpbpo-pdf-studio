@@ -1,4 +1,4 @@
-import type { InsertPageMetadata, PdfDocument, PdfMetadata, PdfPage, PdfPagePaintEdit } from "../domain/pdf";
+import type { InsertPageMetadata, PdfDocument, PdfMetadata, PdfPage, PdfPagePaintEdit, SplitOutputMode } from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import { clampRenderQualitySettings, THUMBNAIL_SCALE_MAX, THUMBNAIL_SCALE_MIN } from "../domain/pdfSettings";
 
@@ -19,11 +19,14 @@ export type DocumentAction =
   | { type: "rotate-selected"; degrees: 90 | 180 | 270 }
   | { type: "delete-pages"; pageNumbers: number[] }
   | { type: "delete-selected" }
-  | { type: "toggle-tint-selected" }
+  | { type: "toggle-page-mark"; pageNumber: number }
+  | { type: "toggle-selected-page-marks" }
   | { type: "toggle-hover-zoom" }
   | { type: "toggle-detail-panel" }
   | { type: "set-render-quality-preset"; preset: RenderQualityPreset }
   | { type: "set-custom-render-quality"; settings: RenderQualitySettings }
+  | { type: "set-split-custom-output-folder"; folder: string | null }
+  | { type: "set-split-output-mode"; mode: SplitOutputMode }
   | { type: "set-thumbnail-scale"; scale: number };
 
 export function documentReducer(state: PdfDocument | null, action: DocumentAction): PdfDocument | null {
@@ -62,8 +65,10 @@ export function documentReducer(state: PdfDocument | null, action: DocumentActio
       return state ? deletePages(state, new Set(action.pageNumbers)) : state;
     case "delete-selected":
       return state ? deleteSelectedPages(state) : state;
-    case "toggle-tint-selected":
-      return state ? markDirty(updateSelectedPages(state, (page) => ({ ...page, tinted: !page.tinted }))) : state;
+    case "toggle-page-mark":
+      return state ? updatePage(state, action.pageNumber, (page) => ({ ...page, tinted: !page.tinted })) : state;
+    case "toggle-selected-page-marks":
+      return state ? toggleSelectedPageMarks(state) : state;
     case "toggle-hover-zoom":
       return state ? { ...state, hoverZoomEnabled: !state.hoverZoomEnabled } : state;
     case "toggle-detail-panel":
@@ -72,6 +77,10 @@ export function documentReducer(state: PdfDocument | null, action: DocumentActio
       return state ? { ...state, renderQualityPreset: action.preset } : state;
     case "set-custom-render-quality":
       return state ? { ...state, customRenderQuality: clampRenderQualitySettings(action.settings), renderQualityPreset: "custom" } : state;
+    case "set-split-custom-output-folder":
+      return state ? { ...state, splitCustomOutputFolder: action.folder } : state;
+    case "set-split-output-mode":
+      return state ? { ...state, splitOutputMode: action.mode } : state;
     case "set-thumbnail-scale":
       return state ? { ...state, thumbnailScale: clampThumbnailScale(action.scale) } : state;
     default:
@@ -153,6 +162,16 @@ function updateSelectedPages(
 ): PdfDocument {
   const pages = document.pages.map((page) => (document.selectedPages.has(page.pageNumber) ? updater(page) : page));
   return { ...document, pages };
+}
+
+function toggleSelectedPageMarks(document: PdfDocument): PdfDocument {
+  const selectedPages = document.pages.filter((page) => document.selectedPages.has(page.pageNumber));
+  if (selectedPages.length === 0) {
+    return document;
+  }
+
+  const shouldMark = selectedPages.some((page) => !page.tinted);
+  return updateSelectedPages(document, (page) => ({ ...page, tinted: shouldMark }));
 }
 
 function insertPagesAfterSelection(document: PdfDocument, pages: InsertPageMetadata[]): PdfDocument {

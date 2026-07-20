@@ -1,6 +1,6 @@
 [package]
 name = "splitpdf_studio"
-version = "0.2.0"
+version = "0.2.1"
 description = "A local-first PDF split and edit desktop app"
 authors = ["MpBPO PDF Studio"]
 edition = "2021"
@@ -25,3 +25,4 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-updater = "2.10.1"
 thiserror = "2"
+ttf-parser = "0.25"

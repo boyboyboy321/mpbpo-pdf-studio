@@ -1,4 +1,4 @@
-import { FileImage, FileOutput, FilePlus2, Files, Folder, Home, Image, Plus, Search, Shield, Upload } from "lucide-react";
+import { FileImage, FilePenLine, Files, Folder, Home, Plus, Search, Upload } from "lucide-react";
 import { useState } from "react";
 
 import type { PdfLoadState, RecentFile, ToolItem } from "../domain/pdf";
@@ -15,11 +15,7 @@ interface HomeViewProps {
 
 const toolIcons: Record<ToolItem["id"], typeof Files> = {
   split: Files,
-  compress: FileOutput,
-  office: FilePlus2,
-  image: Image,
-  protect: Shield,
-  merge: Folder,
+  edit: FilePenLine,
 };
 
 export function HomeView({ isFileDragging, loadState, recentFiles, onOpenDemo, onOpenRecent, onPickPdf }: HomeViewProps) {

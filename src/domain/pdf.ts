@@ -68,6 +68,8 @@ export type PdfPagePaintEdit =
 
 export type PdfTextAlign = "left" | "center" | "right";
 
+export type SplitOutputMode = "siblingFolder" | "originalFolderDeleteOriginal" | "customFolder";
+
 export interface PdfDocument {
   detailPanelVisible: boolean;
   id: string;
@@ -82,6 +84,8 @@ export interface PdfDocument {
   hoverZoomEnabled: boolean;
   customRenderQuality: RenderQualitySettings;
   renderQualityPreset: RenderQualityPreset;
+  splitCustomOutputFolder: string | null;
+  splitOutputMode: SplitOutputMode;
   thumbnailScale: number;
 }
 
@@ -117,6 +121,12 @@ export interface SplitOutputFile {
 export interface SplitResult {
   outputDir: string;
   files: SplitOutputFile[];
+  sourceDeleteError?: string | null;
+}
+
+export interface SplitOutputOptions {
+  customFolderPath: string | null;
+  mode: SplitOutputMode;
 }
 
 export interface SplitProgressEvent {

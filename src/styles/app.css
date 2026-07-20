@@ -812,7 +812,7 @@ button:disabled {
 }
 
 .page-card.is-drag-moving {
-  opacity: 0.46;
+  opacity: 1;
 }
 
 .page-drag-overlay {
@@ -1019,19 +1019,15 @@ button:disabled {
   transform: rotate(-14deg);
 }
 
-.mock-paper.is-tinted::after {
+.mock-paper.is-tinted::after,
+.page-preview-paper.is-tinted::after {
   content: "";
   position: absolute;
   inset: 0;
-  background: rgba(25, 189, 99, 0.15);
-}
-
-.page-preview-paper.is-tinted::after,
-.magnifier-preview.is-tinted::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: rgba(25, 189, 99, 0.15);
+  z-index: 5;
+  border-radius: inherit;
+  background: rgba(245, 158, 11, 0.22);
+  pointer-events: none;
 }
 
 .mock-paper.is-deleted::before {
@@ -1127,6 +1123,16 @@ button:disabled {
 .page-card-actions button.is-danger:focus-visible {
   color: var(--red);
   background: #fff0f2;
+}
+
+.page-card-actions button.is-marked {
+  color: #d97706;
+  background: #fff7ed;
+}
+
+.page-card-actions button.is-marked svg,
+.rail-tool.is-marked svg {
+  fill: currentColor;
 }
 
 .page-slot:hover .page-card-actions,
@@ -1398,6 +1404,168 @@ button:disabled {
   color: var(--text);
 }
 
+.split-location-control {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.split-location-control > label {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.split-location-picker {
+  position: relative;
+}
+
+.split-location-trigger {
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcff;
+  color: var(--text);
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.split-location-trigger:hover,
+.split-location-trigger:focus-visible,
+.split-location-picker.is-open .split-location-trigger {
+  border-color: rgba(11, 87, 255, 0.38);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px rgba(11, 87, 255, 0.1);
+  outline: 0;
+}
+
+.split-location-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.split-location-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.split-location-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.split-location-copy strong,
+.split-location-menu strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-location-copy small,
+.split-location-menu small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-location-trigger > svg {
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.split-location-picker.is-open .split-location-trigger > svg {
+  transform: rotate(180deg);
+}
+
+.split-location-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 7px);
+  left: 0;
+  z-index: 70;
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.16);
+  padding: 6px;
+}
+
+.split-location-menu button {
+  min-width: 0;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.split-location-menu button > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.split-location-menu button:hover,
+.split-location-menu button:focus-visible,
+.split-location-menu button.is-active {
+  background: var(--blue-soft);
+  outline: 0;
+}
+
+.split-location-menu button.is-active strong,
+.split-location-menu button.is-active svg {
+  color: var(--blue);
+}
+
+.split-location-folder {
+  min-height: 34px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--muted);
+  padding: 0 10px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-location-folder:hover,
+.split-location-folder:focus-visible {
+  border-color: rgba(11, 87, 255, 0.34);
+  color: var(--blue);
+  outline: 0;
+}
+
 .cut-list {
   display: grid;
   gap: 8px;
@@ -1531,6 +1699,16 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   color: rgba(255, 255, 255, 0.92);
+  white-space: nowrap;
+}
+
+.split-toast-warning {
+  min-width: 0;
+  overflow: hidden;
+  color: #ffd166;
+  font-size: 12px;
+  font-weight: 720;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

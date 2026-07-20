@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use thiserror::Error;
+use ttf_parser::Face;
 
 const THUMBNAIL_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const THUMBNAIL_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -121,6 +123,7 @@ struct SplitOutputFile {
 struct SplitResult {
     output_dir: String,
     files: Vec<SplitOutputFile>,
+    source_delete_error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -130,6 +133,35 @@ struct SplitProgress {
     completed_files: usize,
     total_files: usize,
     current_file_name: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SplitOutputMode {
+    SiblingFolder,
+    OriginalFolderDeleteOriginal,
+    CustomFolder,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitOutputOptions {
+    mode: SplitOutputMode,
+    custom_folder_path: Option<String>,
+}
+
+impl Default for SplitOutputOptions {
+    fn default() -> Self {
+        Self {
+            mode: SplitOutputMode::SiblingFolder,
+            custom_folder_path: None,
+        }
+    }
+}
+
+struct SplitOutputPlan {
+    delete_source_after_success: bool,
+    output_dir: PathBuf,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -473,10 +505,11 @@ async fn split_pdf(
     app: tauri::AppHandle,
     path: String,
     cut_before_pages: Vec<u32>,
+    output_options: Option<SplitOutputOptions>,
     run_id: String,
 ) -> Result<SplitResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        split_pdf_impl(path, cut_before_pages, run_id, |progress| {
+        split_pdf_impl(path, cut_before_pages, run_id, output_options, |progress| {
             let _ = app.emit(SPLIT_PROGRESS_EVENT, progress);
         })
     })
@@ -490,12 +523,20 @@ async fn split_pdf_with_edits(
     path: String,
     pages: Vec<EditPagePlan>,
     cut_before_pages: Vec<u32>,
+    output_options: Option<SplitOutputOptions>,
     run_id: String,
 ) -> Result<SplitResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        split_pdf_with_edits_impl(path, pages, cut_before_pages, run_id, |progress| {
-            let _ = app.emit(SPLIT_PROGRESS_EVENT, progress);
-        })
+        split_pdf_with_edits_impl(
+            path,
+            pages,
+            cut_before_pages,
+            run_id,
+            output_options,
+            |progress| {
+                let _ = app.emit(SPLIT_PROGRESS_EVENT, progress);
+            },
+        )
     })
     .await
     .map_err(|error| AppError::State(format!("PDF split task failed: {error}")))?
@@ -565,6 +606,7 @@ fn split_pdf_impl<F>(
     path: String,
     cut_before_pages: Vec<u32>,
     run_id: String,
+    output_options: Option<SplitOutputOptions>,
     mut on_progress: F,
 ) -> Result<SplitResult, AppError>
 where
@@ -577,7 +619,9 @@ where
     let page_count = document_page_count(&source_document)?;
     let ranges = build_ranges(page_count, cut_before_pages)?;
     let run_prefix = split_run_prefix();
-    let output_dir = unique_output_dir(output_dir_for(file_path, &run_prefix));
+    let output_plan =
+        split_output_plan(file_path, output_options.unwrap_or_default(), &run_prefix)?;
+    let output_dir = output_plan.output_dir;
     fs::create_dir_all(&output_dir)?;
 
     let stem = file_path
@@ -636,9 +680,14 @@ where
         });
     }
 
+    drop(source_document);
+    let source_delete_error =
+        finalize_split_output(file_path, &files, output_plan.delete_source_after_success)?;
+
     Ok(SplitResult {
         output_dir: output_dir.to_string_lossy().to_string(),
         files,
+        source_delete_error,
     })
 }
 
@@ -647,6 +696,7 @@ fn split_pdf_with_edits_impl<F>(
     pages: Vec<EditPagePlan>,
     cut_before_pages: Vec<u32>,
     run_id: String,
+    output_options: Option<SplitOutputOptions>,
     mut on_progress: F,
 ) -> Result<SplitResult, AppError>
 where
@@ -664,7 +714,9 @@ where
     let page_count = pages.len() as u32;
     let ranges = build_ranges(page_count, cut_before_pages)?;
     let run_prefix = split_run_prefix();
-    let output_dir = unique_output_dir(output_dir_for(file_path, &run_prefix));
+    let output_plan =
+        split_output_plan(file_path, output_options.unwrap_or_default(), &run_prefix)?;
+    let output_dir = output_plan.output_dir;
     fs::create_dir_all(&output_dir)?;
 
     let stem = file_path
@@ -716,9 +768,14 @@ where
         });
     }
 
+    drop(source_documents);
+    let source_delete_error =
+        finalize_split_output(file_path, &files, output_plan.delete_source_after_success)?;
+
     Ok(SplitResult {
         output_dir: output_dir.to_string_lossy().to_string(),
         files,
+        source_delete_error,
     })
 }
 
@@ -1369,6 +1426,105 @@ fn output_dir_for(file_path: &Path, run_prefix: &str) -> PathBuf {
     parent.join(format!("{}_split_{}", stem, run_prefix))
 }
 
+fn split_output_plan(
+    file_path: &Path,
+    output_options: SplitOutputOptions,
+    run_prefix: &str,
+) -> Result<SplitOutputPlan, AppError> {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+
+    match output_options.mode {
+        SplitOutputMode::SiblingFolder => Ok(SplitOutputPlan {
+            delete_source_after_success: false,
+            output_dir: unique_output_dir(output_dir_for(file_path, run_prefix)),
+        }),
+        SplitOutputMode::OriginalFolderDeleteOriginal => Ok(SplitOutputPlan {
+            delete_source_after_success: true,
+            output_dir: parent.to_path_buf(),
+        }),
+        SplitOutputMode::CustomFolder => {
+            let custom_folder_path = output_options
+                .custom_folder_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    AppError::SplitValidation(
+                        "Choose an output folder before splitting".to_string(),
+                    )
+                })?;
+
+            Ok(SplitOutputPlan {
+                delete_source_after_success: false,
+                output_dir: PathBuf::from(custom_folder_path),
+            })
+        }
+    }
+}
+
+fn finalize_split_output(
+    source_path: &Path,
+    files: &[SplitOutputFile],
+    delete_source_after_success: bool,
+) -> Result<Option<String>, AppError> {
+    if files.is_empty() {
+        return Err(AppError::SplitValidation(
+            "No split output files were created".to_string(),
+        ));
+    }
+
+    for file in files {
+        let output_path = Path::new(&file.file_path);
+        let metadata = fs::metadata(output_path)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(AppError::SplitValidation(format!(
+                "Split output is missing or empty: {}",
+                file.file_name
+            )));
+        }
+
+        if delete_source_after_success && output_path == source_path {
+            return Err(AppError::SplitValidation(
+                "Refusing to delete the original because an output path matches it".to_string(),
+            ));
+        }
+    }
+
+    if delete_source_after_success {
+        if let Err(error) = delete_source_file_after_split(source_path) {
+            return Ok(Some(error.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn delete_source_file_after_split(source_path: &Path) -> Result<(), AppError> {
+    const DELETE_RETRY_COUNT: usize = 40;
+    const DELETE_RETRY_DELAY: Duration = Duration::from_millis(250);
+    let mut last_error = String::new();
+
+    for attempt in 0..DELETE_RETRY_COUNT {
+        if !source_path.exists() {
+            return Ok(());
+        }
+
+        match fs::remove_file(source_path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt + 1 < DELETE_RETRY_COUNT {
+                    thread::sleep(DELETE_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(AppError::State(format!(
+        "Could not delete the original PDF after splitting: {last_error}"
+    )))
+}
+
 fn split_run_prefix() -> String {
     Local::now().format("%Y%m%d_%H%M%S_%3f").to_string()
 }
@@ -1881,11 +2037,17 @@ fn append_paint_edits_to_page(
     let has_text = paint_edits
         .iter()
         .any(|edit| matches!(edit, PagePaintEdit::Text { text, .. } if !text.trim().is_empty()));
-    if has_text {
-        ensure_paint_font(output_document, page_dictionary);
-    }
+    let paint_fonts = if has_text {
+        Some(ensure_paint_fonts(
+            output_document,
+            page_dictionary,
+            paint_edits,
+        )?)
+    } else {
+        None
+    };
 
-    let content = paint_edits_content(paint_edits, page_box);
+    let content = paint_edits_content(paint_edits, page_box, paint_fonts.as_ref());
     if content.trim().is_empty() {
         return Ok(());
     }
@@ -1897,7 +2059,11 @@ fn append_paint_edits_to_page(
     Ok(())
 }
 
-fn paint_edits_content(paint_edits: &[PagePaintEdit], page_box: PageBox) -> String {
+fn paint_edits_content(
+    paint_edits: &[PagePaintEdit],
+    page_box: PageBox,
+    paint_fonts: Option<&PaintFontResources>,
+) -> String {
     let mut content = String::new();
 
     for edit in paint_edits {
@@ -1950,26 +2116,23 @@ fn paint_edits_content(paint_edits: &[PagePaintEdit], page_box: PageBox) -> Stri
                     continue;
                 }
 
-                let (r, g, b) = parse_pdf_rgb(color, (0.0, 0.0, 0.0));
-                let font_size = font_size.clamp(6.0, 96.0);
-                let font_key = match (*bold, *italic) {
-                    (true, true) => "SPFBI",
-                    (true, false) => "SPFB",
-                    (false, true) => "SPFI",
-                    (false, false) => "SPF1",
+                let Some(font) = paint_fonts.and_then(|fonts| fonts.get(*bold, *italic)) else {
+                    continue;
                 };
+                let (r, g, b) = parse_pdf_rgb(color, (0.0, 0.0, 0.0));
+                let font_size = pdf_text_font_size(*font_size, &page_box);
                 let text_x = page_box.x1 + normalized_to_page(*x, page_box.width);
                 let text_width = normalized_to_page(*width, page_box.width).max(font_size * 2.0);
                 let text_height = normalized_to_page(*height, page_box.height).max(font_size * 1.2);
                 let text_top = page_box.y2 - normalized_to_page(*y, page_box.height);
                 let line_height = font_size * 1.2;
                 let max_lines = (text_height / line_height).floor().max(1.0) as usize;
-                let lines = wrap_pdf_text(text, text_width, font_size, max_lines);
+                let lines = wrap_pdf_text(text, text_width, font_size, max_lines, font);
 
                 content.push_str("q\nBT\n");
                 content.push_str(&format!(
                     "/{} {} Tf\n{} {} {} rg\n",
-                    font_key,
+                    font.resource_key.as_str(),
                     pdf_float(font_size),
                     pdf_float(r),
                     pdf_float(g),
@@ -1978,18 +2141,21 @@ fn paint_edits_content(paint_edits: &[PagePaintEdit], page_box: PageBox) -> Stri
 
                 for (line_index, line) in lines.iter().enumerate() {
                     let line_y = text_top - font_size - line_height * line_index as f64;
-                    let line_width = pdf_text_line_width(line, font_size).min(text_width);
+                    let line_width = pdf_text_line_width(line, font_size, font).min(text_width);
                     let line_x = match text_align.as_str() {
                         "center" => text_x + (text_width - line_width) / 2.0,
                         "right" => text_x + text_width - line_width,
                         _ => text_x,
                     };
-                    let escaped_text = escape_pdf_literal(line);
+                    let encoded_text = font.encode_text_hex(line);
+                    if encoded_text.is_empty() {
+                        continue;
+                    }
                     content.push_str(&format!(
-                        "1 0 0 1 {} {} Tm\n({}) Tj\n",
+                        "1 0 0 1 {} {} Tm\n<{}> Tj\n",
                         pdf_float(line_x),
                         pdf_float(line_y),
-                        escaped_text
+                        encoded_text
                     ));
 
                     if *underline {
@@ -2001,7 +2167,7 @@ fn paint_edits_content(paint_edits: &[PagePaintEdit], page_box: PageBox) -> Stri
                             pdf_float(line_x + line_width),
                             pdf_float(underline_y),
                             pdf_float((font_size / 14.0).clamp(0.6, 2.0)),
-                            font_key,
+                            font.resource_key.as_str(),
                             pdf_float(font_size),
                             pdf_float(r),
                             pdf_float(g),
@@ -2057,19 +2223,27 @@ fn prepend_page_content(page_dictionary: &mut Dictionary, content_id: ObjectId) 
     }
 }
 
-fn wrap_pdf_text(text: &str, width: f64, font_size: f64, max_lines: usize) -> Vec<String> {
-    let max_chars = (width / (font_size * 0.52)).floor().max(1.0) as usize;
+fn wrap_pdf_text(
+    text: &str,
+    width: f64,
+    font_size: f64,
+    max_lines: usize,
+    font: &PdfUnicodeFont,
+) -> Vec<String> {
     let mut lines = Vec::new();
 
     for source_line in text.lines() {
         let mut current_line = String::new();
 
         for word in source_line.split_whitespace() {
-            let next_len = current_line.chars().count()
-                + usize::from(!current_line.is_empty())
-                + word.chars().count();
+            let candidate = if current_line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current_line} {word}")
+            };
 
-            if next_len > max_chars && !current_line.is_empty() {
+            if pdf_text_line_width(&candidate, font_size, font) > width && !current_line.is_empty()
+            {
                 lines.push(current_line);
                 current_line = String::new();
 
@@ -2097,45 +2271,111 @@ fn wrap_pdf_text(text: &str, width: f64, font_size: f64, max_lines: usize) -> Ve
     lines
 }
 
-fn pdf_text_line_width(text: &str, font_size: f64) -> f64 {
-    font_size * text.chars().count() as f64 * 0.52
+fn pdf_text_line_width(text: &str, font_size: f64, font: &PdfUnicodeFont) -> f64 {
+    text.chars()
+        .map(|character| font.width_for_character(character) * font_size / 1000.0)
+        .sum()
+}
+
+fn pdf_text_font_size(visual_font_size: f64, page_box: &PageBox) -> f64 {
+    let visual_font_size = visual_font_size.clamp(6.0, 96.0);
+    let scale = (page_box.height / 842.0).clamp(0.45, 8.0);
+    (visual_font_size * scale).clamp(4.0, 360.0)
 }
 
 fn default_text_align() -> String {
     "left".to_string()
 }
 
-fn ensure_paint_font(output_document: &mut LopdfDocument, page_dictionary: &mut Dictionary) {
-    let regular_font_id = output_document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-        "Encoding" => "WinAnsiEncoding",
-    });
-    let bold_font_id = output_document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica-Bold",
-        "Encoding" => "WinAnsiEncoding",
-    });
-    let italic_font_id = output_document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica-Oblique",
-        "Encoding" => "WinAnsiEncoding",
-    });
-    let bold_italic_font_id = output_document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica-BoldOblique",
-        "Encoding" => "WinAnsiEncoding",
-    });
-    let paint_fonts = [
-        ("SPF1", regular_font_id),
-        ("SPFB", bold_font_id),
-        ("SPFI", italic_font_id),
-        ("SPFBI", bold_italic_font_id),
-    ];
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum PaintFontStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl PaintFontStyle {
+    fn from_flags(bold: bool, italic: bool) -> Self {
+        match (bold, italic) {
+            (true, true) => Self::BoldItalic,
+            (true, false) => Self::Bold,
+            (false, true) => Self::Italic,
+            (false, false) => Self::Regular,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Regular => "Regular",
+            Self::Bold => "Bold",
+            Self::Italic => "Italic",
+            Self::BoldItalic => "BoldItalic",
+        }
+    }
+}
+
+struct PaintFontResources {
+    fonts: HashMap<PaintFontStyle, PdfUnicodeFont>,
+}
+
+impl PaintFontResources {
+    fn get(&self, bold: bool, italic: bool) -> Option<&PdfUnicodeFont> {
+        let style = PaintFontStyle::from_flags(bold, italic);
+        self.fonts
+            .get(&style)
+            .or_else(|| self.fonts.get(&PaintFontStyle::Regular))
+    }
+}
+
+struct PdfUnicodeFont {
+    cid_by_char: HashMap<char, u16>,
+    resource_key: String,
+    width_by_cid: HashMap<u16, f64>,
+}
+
+impl PdfUnicodeFont {
+    fn encode_text_hex(&self, text: &str) -> String {
+        let mut encoded = String::with_capacity(text.len() * 4);
+        for character in text.chars() {
+            let character = if character == '\t' { ' ' } else { character };
+            if let Some(cid) = self.cid_by_char.get(&character) {
+                let _ = write!(encoded, "{cid:04X}");
+            }
+        }
+        encoded
+    }
+
+    fn width_for_character(&self, character: char) -> f64 {
+        let character = if character == '\t' { ' ' } else { character };
+        self.cid_by_char
+            .get(&character)
+            .and_then(|cid| self.width_by_cid.get(cid))
+            .copied()
+            .unwrap_or(520.0)
+    }
+}
+
+fn ensure_paint_fonts(
+    output_document: &mut LopdfDocument,
+    page_dictionary: &mut Dictionary,
+    paint_edits: &[PagePaintEdit],
+) -> Result<PaintFontResources, AppError> {
+    let mut fonts = HashMap::new();
+    let mut paint_fonts = Vec::new();
+
+    for (style, characters) in collect_paint_text_characters(paint_edits) {
+        let font = create_pdf_unicode_font(output_document, style, &characters)?;
+        paint_fonts.push((font.resource_key.clone(), font.font_id));
+        fonts.insert(
+            style,
+            PdfUnicodeFont {
+                cid_by_char: font.cid_by_char,
+                resource_key: font.resource_key,
+                width_by_cid: font.width_by_cid,
+            },
+        );
+    }
 
     match page_dictionary.get_mut(b"Resources") {
         Ok(Object::Dictionary(resources)) => {
@@ -2164,13 +2404,258 @@ fn ensure_paint_font(output_document: &mut LopdfDocument, page_dictionary: &mut 
             );
         }
     }
+
+    Ok(PaintFontResources { fonts })
 }
 
-fn ensure_font_resource(resources: &mut Dictionary, paint_fonts: &[(&str, ObjectId)]) {
+struct CreatedPdfUnicodeFont {
+    cid_by_char: HashMap<char, u16>,
+    font_id: ObjectId,
+    resource_key: String,
+    width_by_cid: HashMap<u16, f64>,
+}
+
+fn collect_paint_text_characters(
+    paint_edits: &[PagePaintEdit],
+) -> BTreeMap<PaintFontStyle, BTreeSet<char>> {
+    let mut characters_by_style: BTreeMap<PaintFontStyle, BTreeSet<char>> = BTreeMap::new();
+
+    for edit in paint_edits {
+        let PagePaintEdit::Text {
+            bold, italic, text, ..
+        } = edit
+        else {
+            continue;
+        };
+
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let characters = characters_by_style
+            .entry(PaintFontStyle::from_flags(*bold, *italic))
+            .or_default();
+        characters.insert(' ');
+        for character in text.chars() {
+            match character {
+                '\n' | '\r' => {}
+                '\t' => {
+                    characters.insert(' ');
+                }
+                _ if character.is_control() => {}
+                _ => {
+                    characters.insert(character);
+                }
+            }
+        }
+    }
+
+    characters_by_style
+}
+
+fn create_pdf_unicode_font(
+    output_document: &mut LopdfDocument,
+    style: PaintFontStyle,
+    characters: &BTreeSet<char>,
+) -> Result<CreatedPdfUnicodeFont, AppError> {
+    let font_bytes = fs::read(paint_font_path(style))?;
+    let face = Face::parse(&font_bytes, 0)
+        .map_err(|_| AppError::Preview("Could not load the PDF text font.".to_string()))?;
+    let units_per_em = f64::from(face.units_per_em());
+    let fallback_glyph = face.glyph_index('?').or_else(|| face.glyph_index(' '));
+    let mut cid_by_char = HashMap::new();
+    let mut cid_to_gid = vec![0_u16];
+    let mut width_by_cid = HashMap::new();
+
+    for (index, character) in characters.iter().enumerate() {
+        let cid = u16::try_from(index + 1).map_err(|_| {
+            AppError::SplitValidation("Too many unique text characters on one page".to_string())
+        })?;
+        let glyph = face
+            .glyph_index(*character)
+            .or(fallback_glyph)
+            .ok_or_else(|| {
+                AppError::Preview("Could not map a text glyph into the PDF font.".to_string())
+            })?;
+        let advance = face
+            .glyph_hor_advance(glyph)
+            .map(f64::from)
+            .unwrap_or(units_per_em * 0.52);
+        cid_by_char.insert(*character, cid);
+        cid_to_gid.push(glyph.0);
+        width_by_cid.insert(cid, advance * 1000.0 / units_per_em);
+    }
+
+    let font_name = format!("MPBPOArial{}", style.suffix());
+    let descriptor = font_descriptor_dictionary(&face, &font_name, style);
+    let mut font_file_stream = Stream::new(
+        dictionary! {
+            "Length1" => font_bytes.len() as i64,
+        },
+        font_bytes,
+    );
+    font_file_stream.compress()?;
+    let font_file_id = output_document.add_object(font_file_stream);
+    let mut descriptor = descriptor;
+    descriptor.set("FontFile2", font_file_id);
+    let descriptor_id = output_document.add_object(descriptor);
+
+    let mut cid_to_gid_bytes = Vec::with_capacity(cid_to_gid.len() * 2);
+    for gid in cid_to_gid {
+        cid_to_gid_bytes.extend_from_slice(&gid.to_be_bytes());
+    }
+    let mut cid_to_gid_stream = Stream::new(dictionary! {}, cid_to_gid_bytes);
+    cid_to_gid_stream.compress()?;
+    let cid_to_gid_id = output_document.add_object(cid_to_gid_stream);
+
+    let width_objects: Vec<Object> = (1..=characters.len())
+        .map(|index| {
+            let cid = index as u16;
+            Object::Integer(width_by_cid.get(&cid).copied().unwrap_or(520.0).round() as i64)
+        })
+        .collect();
+    let cid_font_id = output_document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => Object::Name(font_name.as_bytes().to_vec()),
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "CIDToGIDMap" => cid_to_gid_id,
+        "W" => Object::Array(vec![Object::Integer(1), Object::Array(width_objects)]),
+    });
+
+    let mut to_unicode_stream = Stream::new(
+        dictionary! {},
+        to_unicode_cmap(&font_name, &cid_by_char).into_bytes(),
+    );
+    to_unicode_stream.compress()?;
+    let to_unicode_id = output_document.add_object(to_unicode_stream);
+    let font_id = output_document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => Object::Name(font_name.as_bytes().to_vec()),
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font_id)]),
+        "ToUnicode" => to_unicode_id,
+    });
+
+    Ok(CreatedPdfUnicodeFont {
+        cid_by_char,
+        font_id,
+        resource_key: format!("SPF{}", font_id.0),
+        width_by_cid,
+    })
+}
+
+fn paint_font_path(style: PaintFontStyle) -> PathBuf {
+    let windows_fonts = Path::new(r"C:\Windows\Fonts");
+    let styled_font = match style {
+        PaintFontStyle::Regular => windows_fonts.join("arial.ttf"),
+        PaintFontStyle::Bold => windows_fonts.join("arialbd.ttf"),
+        PaintFontStyle::Italic => windows_fonts.join("ariali.ttf"),
+        PaintFontStyle::BoldItalic => windows_fonts.join("arialbi.ttf"),
+    };
+
+    if styled_font.exists() {
+        return styled_font;
+    }
+
+    let regular_font = windows_fonts.join("arial.ttf");
+    if regular_font.exists() {
+        return regular_font;
+    }
+
+    windows_fonts.join("segoeui.ttf")
+}
+
+fn font_descriptor_dictionary(
+    face: &Face<'_>,
+    font_name: &str,
+    style: PaintFontStyle,
+) -> Dictionary {
+    let units_per_em = f64::from(face.units_per_em());
+    let bbox = face.global_bounding_box();
+    let flags = match style {
+        PaintFontStyle::Italic | PaintFontStyle::BoldItalic => 96,
+        _ => 32,
+    };
+
+    dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => Object::Name(font_name.as_bytes().to_vec()),
+        "Flags" => flags,
+        "FontBBox" => Object::Array(vec![
+            Object::Integer(font_metric(bbox.x_min, units_per_em)),
+            Object::Integer(font_metric(bbox.y_min, units_per_em)),
+            Object::Integer(font_metric(bbox.x_max, units_per_em)),
+            Object::Integer(font_metric(bbox.y_max, units_per_em)),
+        ]),
+        "Ascent" => font_metric(face.ascender(), units_per_em),
+        "Descent" => font_metric(face.descender(), units_per_em),
+        "CapHeight" => font_metric(face.ascender(), units_per_em),
+        "ItalicAngle" => if matches!(style, PaintFontStyle::Italic | PaintFontStyle::BoldItalic) { -12 } else { 0 },
+        "StemV" => if matches!(style, PaintFontStyle::Bold | PaintFontStyle::BoldItalic) { 110 } else { 80 },
+    }
+}
+
+fn font_metric(value: i16, units_per_em: f64) -> i64 {
+    (f64::from(value) * 1000.0 / units_per_em).round() as i64
+}
+
+fn to_unicode_cmap(font_name: &str, cid_by_char: &HashMap<char, u16>) -> String {
+    let mut entries: Vec<(u16, char)> = cid_by_char
+        .iter()
+        .map(|(character, cid)| (*cid, *character))
+        .collect();
+    entries.sort_by_key(|(cid, _)| *cid);
+
+    let mut cmap = String::new();
+    let _ = writeln!(cmap, "/CIDInit /ProcSet findresource begin");
+    let _ = writeln!(cmap, "12 dict begin");
+    let _ = writeln!(cmap, "begincmap");
+    let _ = writeln!(
+        cmap,
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def"
+    );
+    let _ = writeln!(cmap, "/CMapName /{font_name}-ToUnicode def");
+    let _ = writeln!(cmap, "/CMapType 2 def");
+    let _ = writeln!(cmap, "1 begincodespacerange");
+    let _ = writeln!(cmap, "<0000> <FFFF>");
+    let _ = writeln!(cmap, "endcodespacerange");
+
+    for chunk in entries.chunks(100) {
+        let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
+        for (cid, character) in chunk {
+            let _ = writeln!(cmap, "<{cid:04X}> <{}>", unicode_hex(*character));
+        }
+        let _ = writeln!(cmap, "endbfchar");
+    }
+
+    let _ = writeln!(cmap, "endcmap");
+    let _ = writeln!(cmap, "CMapName currentdict /CMap defineresource pop");
+    let _ = writeln!(cmap, "end");
+    let _ = writeln!(cmap, "end");
+    cmap
+}
+
+fn unicode_hex(character: char) -> String {
+    let mut encoded = String::new();
+    let mut buffer = [0_u16; 2];
+    for unit in character.encode_utf16(&mut buffer) {
+        let _ = write!(encoded, "{unit:04X}");
+    }
+    encoded
+}
+
+fn ensure_font_resource(resources: &mut Dictionary, paint_fonts: &[(String, ObjectId)]) {
     match resources.get_mut(b"Font") {
         Ok(Object::Dictionary(fonts)) => {
             for (font_key, font_id) in paint_fonts {
-                fonts.set(*font_key, *font_id);
+                fonts.set(font_key.as_str(), *font_id);
             }
         }
         _ => {
@@ -2179,10 +2664,10 @@ fn ensure_font_resource(resources: &mut Dictionary, paint_fonts: &[(&str, Object
     }
 }
 
-fn paint_fonts_dictionary(paint_fonts: &[(&str, ObjectId)]) -> Dictionary {
+fn paint_fonts_dictionary(paint_fonts: &[(String, ObjectId)]) -> Dictionary {
     let mut fonts = Dictionary::new();
     for (font_key, font_id) in paint_fonts {
-        fonts.set(*font_key, *font_id);
+        fonts.set(font_key.as_str(), *font_id);
     }
     fonts
 }
@@ -2257,20 +2742,6 @@ fn parse_pdf_rgb(value: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
         f64::from(green) / 255.0,
         f64::from(blue) / 255.0,
     )
-}
-
-fn escape_pdf_literal(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii())
-        .flat_map(|character| match character {
-            '(' => "\\(".chars().collect::<Vec<_>>(),
-            ')' => "\\)".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' | '\r' => " ".chars().collect::<Vec<_>>(),
-            _ => vec![character],
-        })
-        .collect()
 }
 
 fn apply_page_rotation(page_dictionary: &mut Dictionary, rotation: u16) {
@@ -2741,10 +3212,61 @@ mod tests {
                 },
             ],
             page_box,
+            None,
         );
 
         assert!(content.contains("120 50 40 600 re"));
         assert!(content.contains("480 50 40 600 re"));
+    }
+
+    #[test]
+    fn paint_text_uses_unicode_cids_and_scales_with_page_size() {
+        let mut cid_by_char = HashMap::new();
+        cid_by_char.insert(' ', 1);
+        cid_by_char.insert('h', 2);
+        cid_by_char.insert('\u{1EC7}', 3);
+        let mut width_by_cid = HashMap::new();
+        width_by_cid.insert(1, 260.0);
+        width_by_cid.insert(2, 520.0);
+        width_by_cid.insert(3, 520.0);
+        let mut fonts = HashMap::new();
+        fonts.insert(
+            PaintFontStyle::Regular,
+            PdfUnicodeFont {
+                cid_by_char,
+                resource_key: "SPFTest".to_string(),
+                width_by_cid,
+            },
+        );
+        let resources = PaintFontResources { fonts };
+        let page_box = PageBox {
+            height: 1684.0,
+            width: 1190.0,
+            x1: 0.0,
+            y1: 0.0,
+            y2: 1684.0,
+        };
+        let content = paint_edits_content(
+            &[PagePaintEdit::Text {
+                bold: false,
+                color: "#111827".to_string(),
+                font_family: "Arial".to_string(),
+                font_size: 13.0,
+                height: 0.1,
+                italic: false,
+                text_align: "left".to_string(),
+                text: "h\u{1EC7}".to_string(),
+                underline: false,
+                width: 0.2,
+                x: 0.1,
+                y: 0.1,
+            }],
+            page_box,
+            Some(&resources),
+        );
+
+        assert!(content.contains("/SPFTest 26 Tf"));
+        assert!(content.contains("<00020003> Tj"));
     }
 
     #[test]
@@ -2759,6 +3281,7 @@ mod tests {
             source_path.to_string_lossy().to_string(),
             vec![3],
             "test-run".to_string(),
+            None,
             |_| {},
         )
         .expect("split smoke pdf");
@@ -2797,6 +3320,40 @@ mod tests {
         assert_eq!(result.files[1].file_name, "Doc103480001_002.pdf");
         assert_eq!(result.files[0].page_count, 2);
         assert_eq!(result.files[1].page_count, 2);
+
+        let _ = fs::remove_dir_all(&work_dir);
+    }
+
+    #[test]
+    fn split_pdf_can_write_next_to_original_and_delete_source_after_success() {
+        let work_dir = std::env::temp_dir().join(format!(
+            "splitpdf-split-delete-source-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&work_dir);
+        fs::create_dir_all(&work_dir).expect("create split delete smoke dir");
+        let source_path = work_dir.join("DocDeleteSource.pdf");
+        create_smoke_pdf_with_page_count(&source_path, 3);
+
+        let result = split_pdf_impl(
+            source_path.to_string_lossy().to_string(),
+            vec![2, 3],
+            "test-run-delete".to_string(),
+            Some(SplitOutputOptions {
+                custom_folder_path: None,
+                mode: SplitOutputMode::OriginalFolderDeleteOriginal,
+            }),
+            |_| {},
+        )
+        .expect("split and delete source smoke pdf");
+
+        assert_eq!(PathBuf::from(&result.output_dir), work_dir);
+        assert_eq!(result.files.len(), 3);
+        assert!(result
+            .files
+            .iter()
+            .all(|file| Path::new(&file.file_path).parent() == Some(work_dir.as_path())));
+        assert!(!source_path.exists());
 
         let _ = fs::remove_dir_all(&work_dir);
     }

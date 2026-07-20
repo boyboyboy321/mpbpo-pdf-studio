@@ -1,3 +1,4 @@
+import type { SplitOutputMode } from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import {
   clampRenderQualitySettings,
@@ -13,6 +14,8 @@ export interface EditorPreferences {
   customRenderQuality: RenderQualitySettings;
   detailPanelVisible: boolean;
   renderQualityPreset: RenderQualityPreset;
+  splitCustomOutputFolder: string | null;
+  splitOutputMode: SplitOutputMode;
   thumbnailScale: number;
 }
 
@@ -22,6 +25,8 @@ export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
   customRenderQuality: DEFAULT_CUSTOM_RENDER_QUALITY,
   detailPanelVisible: true,
   renderQualityPreset: DEFAULT_RENDER_QUALITY_PRESET,
+  splitCustomOutputFolder: null,
+  splitOutputMode: "siblingFolder",
   thumbnailScale: DEFAULT_THUMBNAIL_SCALE,
 };
 
@@ -48,6 +53,11 @@ export function loadEditorPreferences(): EditorPreferences {
       renderQualityPreset: isRenderQualityPreset(parsedValue.renderQualityPreset)
         ? parsedValue.renderQualityPreset
         : DEFAULT_EDITOR_PREFERENCES.renderQualityPreset,
+      splitCustomOutputFolder:
+        typeof parsedValue.splitCustomOutputFolder === "string" && parsedValue.splitCustomOutputFolder.trim().length > 0
+          ? parsedValue.splitCustomOutputFolder
+          : DEFAULT_EDITOR_PREFERENCES.splitCustomOutputFolder,
+      splitOutputMode: isSplitOutputMode(parsedValue.splitOutputMode) ? parsedValue.splitOutputMode : DEFAULT_EDITOR_PREFERENCES.splitOutputMode,
       thumbnailScale: typeof parsedValue.thumbnailScale === "number" ? clampThumbnailScale(parsedValue.thumbnailScale) : DEFAULT_EDITOR_PREFERENCES.thumbnailScale,
     };
   } catch {
@@ -67,6 +77,8 @@ export function saveEditorPreferences(preferences: EditorPreferences) {
         customRenderQuality: clampRenderQualitySettings(preferences.customRenderQuality),
         detailPanelVisible: preferences.detailPanelVisible,
         renderQualityPreset: preferences.renderQualityPreset,
+        splitCustomOutputFolder: preferences.splitCustomOutputFolder,
+        splitOutputMode: preferences.splitOutputMode,
         thumbnailScale: clampThumbnailScale(preferences.thumbnailScale),
       }),
     );
@@ -99,4 +111,8 @@ function numberOrDefault(value: unknown, fallback: number): number {
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSplitOutputMode(value: unknown): value is SplitOutputMode {
+  return value === "siblingFolder" || value === "originalFolderDeleteOriginal" || value === "customFolder";
 }

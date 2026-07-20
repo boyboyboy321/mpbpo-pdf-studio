@@ -194,9 +194,18 @@ export function App() {
       customRenderQuality: document.customRenderQuality,
       detailPanelVisible: document.detailPanelVisible,
       renderQualityPreset: document.renderQualityPreset,
+      splitCustomOutputFolder: document.splitCustomOutputFolder,
+      splitOutputMode: document.splitOutputMode,
       thumbnailScale: document.thumbnailScale,
     });
-  }, [document?.customRenderQuality, document?.detailPanelVisible, document?.renderQualityPreset, document?.thumbnailScale]);
+  }, [
+    document?.customRenderQuality,
+    document?.detailPanelVisible,
+    document?.renderQualityPreset,
+    document?.splitCustomOutputFolder,
+    document?.splitOutputMode,
+    document?.thumbnailScale,
+  ]);
 
   const openPdfPath = useCallback(async (path: string) => {
     if (document?.isDirty) {

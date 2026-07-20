@@ -1,5 +1,6 @@
 import type { PdfDocument, PdfMetadata, PdfPage, PdfPageSource, ToolItem } from "../domain/pdf";
 import { loadEditorPreferences } from "../services/editorPreferences";
+import { applyStoredPageMarks } from "../services/pageMarks";
 
 export function createPages(count: number, sourcePath: string | null = null, sourceFileName = "document.pdf"): PdfPage[] {
   return Array.from({ length: count }, (_, index) => {
@@ -49,7 +50,7 @@ export function createDemoDocument(): PdfDocument {
 export function createDocument(input: { filePath: string | null; fileName: string; sizeBytes: number; pageCount: number }): PdfDocument {
   const preferences = loadEditorPreferences();
 
-  return {
+  return applyStoredPageMarks({
     detailPanelVisible: preferences.detailPanelVisible,
     id: crypto.randomUUID(),
     isDirty: false,
@@ -63,15 +64,13 @@ export function createDocument(input: { filePath: string | null; fileName: strin
     hoverZoomEnabled: false,
     customRenderQuality: preferences.customRenderQuality,
     renderQualityPreset: preferences.renderQualityPreset,
+    splitCustomOutputFolder: preferences.splitCustomOutputFolder,
+    splitOutputMode: preferences.splitOutputMode,
     thumbnailScale: preferences.thumbnailScale,
-  };
+  });
 }
 
 export const tools: ToolItem[] = [
   { id: "split", label: "Split PDF", tone: "blue" },
-  { id: "compress", label: "Compress PDF", tone: "red" },
-  { id: "office", label: "PDF to Office", tone: "red" },
-  { id: "image", label: "PDF to Image", tone: "yellow" },
-  { id: "protect", label: "Protect PDF", tone: "pink" },
-  { id: "merge", label: "Merge PDF", tone: "purple" },
+  { id: "edit", label: "Edit PDF", tone: "green" },
 ];
