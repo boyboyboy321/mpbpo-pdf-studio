@@ -4,7 +4,7 @@
   "version": "0.2.4",
   "minVersion": "0.0.0",
   "mandatoryUpdate": true,
-  "blocked": true,
+  "blocked": false,
   "blockedVersions": [],
   "message": "MpBPO PDF Studio 0.2.4 is active."
 }
