@@ -4003,13 +4003,14 @@ dependencies = [
 
 [[package]]
 name = "splitpdf_studio"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "image",
  "lopdf",
  "pdfium-auto",
  "pdfium-render",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",

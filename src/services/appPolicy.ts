@@ -1,3 +1,5 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+
 export type AppPolicy = {
   appId?: string;
   blocked?: boolean;
@@ -10,7 +12,7 @@ export type AppPolicy = {
   version?: string;
 };
 
-export const APP_VERSION = "0.2.3";
+export const APP_VERSION = "0.2.4";
 
 const APP_POLICY_URLS = [
   "https://raw.githubusercontent.com/boyboyboy321/mpbpo-pdf-studio/main/app-policy.json",
@@ -73,6 +75,10 @@ async function fetchPolicy(url: string) {
 }
 
 export async function loadAppPolicy() {
+  if (isTauri()) {
+    return await invoke<AppPolicy>("fetch_app_policy");
+  }
+
   const errors: unknown[] = [];
 
   for (const url of APP_POLICY_URLS) {

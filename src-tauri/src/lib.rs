@@ -34,6 +34,10 @@ const PREVIEW_TARGET_WIDTH_MAX: i32 = 2200;
 const PREVIEW_TARGET_HEIGHT_MAX: i32 = 4200;
 const OPEN_PDF_PATHS_EVENT: &str = "open-pdf-paths";
 const SPLIT_PROGRESS_EVENT: &str = "split-progress";
+const APP_POLICY_URLS: [&str; 2] = [
+    "https://raw.githubusercontent.com/boyboyboy321/mpbpo-pdf-studio/main/app-policy.json",
+    "https://github.com/boyboyboy321/mpbpo-pdf-studio/releases/latest/download/app-policy.json",
+];
 const PAGE_INHERITABLE_KEYS: [&[u8]; 8] = [
     b"Resources",
     b"MediaBox",
@@ -140,6 +144,20 @@ struct SplitProgress {
     completed_files: usize,
     total_files: usize,
     current_file_name: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppPolicy {
+    app_id: Option<String>,
+    blocked: Option<bool>,
+    blocked_message: Option<String>,
+    blocked_versions: Option<Vec<String>>,
+    mandatory_update: Option<bool>,
+    message: Option<String>,
+    min_version: Option<String>,
+    schema_version: Option<u32>,
+    version: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -480,6 +498,52 @@ fn read_startup_pdf_paths() -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[tauri::command]
+async fn fetch_app_policy() -> Result<AppPolicy, AppError> {
+    tauri::async_runtime::spawn_blocking(fetch_app_policy_impl)
+        .await
+        .map_err(|error| AppError::State(format!("App policy task failed: {error}")))?
+}
+
+fn fetch_app_policy_impl() -> Result<AppPolicy, AppError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .user_agent("MpBPO PDF Studio")
+        .build()
+        .map_err(|error| AppError::State(format!("Could not prepare policy client: {error}")))?;
+
+    let mut errors = Vec::new();
+
+    for url in APP_POLICY_URLS {
+        let response = match client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("{url}: {error}"));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            errors.push(format!("{url}: HTTP {}", response.status()));
+            continue;
+        }
+
+        return response
+            .json::<AppPolicy>()
+            .map_err(|error| AppError::State(format!("Could not parse app policy: {error}")));
+    }
+
+    Err(AppError::State(format!(
+        "Could not load app policy from any source: {}",
+        errors.join("; ")
+    )))
 }
 
 #[tauri::command]
@@ -3351,6 +3415,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             close_main_window,
+            fetch_app_policy,
             minimize_main_window,
             open_folder,
             read_pdf_metadata,
