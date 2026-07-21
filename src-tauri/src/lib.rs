@@ -32,6 +32,7 @@ const SMALL_JPEG_PREVIEW_QUALITY: u8 = 66;
 const PREVIEW_TARGET_WIDTH_MIN: i32 = 72;
 const PREVIEW_TARGET_WIDTH_MAX: i32 = 2200;
 const PREVIEW_TARGET_HEIGHT_MAX: i32 = 4200;
+const OPEN_PDF_PATHS_EVENT: &str = "open-pdf-paths";
 const SPLIT_PROGRESS_EVENT: &str = "split-progress";
 const PAGE_INHERITABLE_KEYS: [&[u8]; 8] = [
     b"Resources",
@@ -89,6 +90,12 @@ struct PdfMetadata {
     file_name: String,
     size_bytes: u64,
     page_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenPdfPathsPayload {
+    paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -258,12 +265,33 @@ struct PageGeometryEdits {
     straighten_degrees: f64,
 }
 
+#[derive(Clone, Copy)]
 struct PageBox {
     height: f64,
     width: f64,
     x1: f64,
     y1: f64,
     y2: f64,
+}
+
+#[derive(Clone, Copy)]
+struct NormalizedPoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy)]
+struct NormalizedRect {
+    height: f64,
+    width: f64,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy)]
+struct PdfPoint {
+    x: f64,
+    y: f64,
 }
 
 #[derive(Clone)]
@@ -432,6 +460,26 @@ fn read_pdf_metadata(path: String) -> Result<PdfMetadata, AppError> {
         size_bytes: metadata.len(),
         page_count,
     })
+}
+
+#[tauri::command]
+fn read_startup_pdf_path() -> Option<String> {
+    read_startup_pdf_paths().into_iter().next()
+}
+
+#[tauri::command]
+fn read_startup_pdf_paths() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .filter_map(|argument| {
+            let path = PathBuf::from(argument);
+            if path.is_file() && is_pdf(&path) {
+                Some(path.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1794,9 +1842,20 @@ fn append_pdf_page(
 
     if let Object::Dictionary(page_dictionary) = &mut page_object {
         page_dictionary.set("Parent", pages_id);
+        let source_rotation = page_rotation(page_dictionary);
         apply_page_rotation(page_dictionary, rotation);
-        append_paint_edits_to_page(output_document, page_dictionary, paint_edits)?;
-        apply_page_geometry_edits(output_document, page_dictionary, paint_edits)?;
+        append_paint_edits_to_page(
+            output_document,
+            page_dictionary,
+            paint_edits,
+            source_rotation,
+        )?;
+        apply_page_geometry_edits(
+            output_document,
+            page_dictionary,
+            paint_edits,
+            source_rotation,
+        )?;
     }
 
     if let Some(previous_output_id) = previous_page_mapping {
@@ -1879,8 +1938,8 @@ fn append_image_page(
         "Contents" => content_id,
     };
     apply_page_rotation(&mut page_dictionary, rotation);
-    append_paint_edits_to_page(output_document, &mut page_dictionary, paint_edits)?;
-    apply_page_geometry_edits(output_document, &mut page_dictionary, paint_edits)?;
+    append_paint_edits_to_page(output_document, &mut page_dictionary, paint_edits, 0)?;
+    apply_page_geometry_edits(output_document, &mut page_dictionary, paint_edits, 0)?;
     let page_id = output_document.add_object(page_dictionary);
     page_refs.push(Object::Reference(page_id));
     Ok(())
@@ -1890,12 +1949,13 @@ fn apply_page_geometry_edits(
     output_document: &mut LopdfDocument,
     page_dictionary: &mut Dictionary,
     paint_edits: &[PagePaintEdit],
+    source_rotation: u16,
 ) -> Result<(), AppError> {
     if paint_edits.is_empty() {
         return Ok(());
     }
 
-    let geometry = page_geometry_edits(paint_edits);
+    let geometry = page_geometry_edits(paint_edits, source_rotation);
     if geometry.straighten_degrees.abs() > 0.001 {
         apply_page_straighten(
             output_document,
@@ -1986,7 +2046,7 @@ fn apply_page_crop(page_dictionary: &mut Dictionary, crop: PageCrop) {
     );
 }
 
-fn page_geometry_edits(paint_edits: &[PagePaintEdit]) -> PageGeometryEdits {
+fn page_geometry_edits(paint_edits: &[PagePaintEdit], source_rotation: u16) -> PageGeometryEdits {
     let mut crop = None;
     let mut straighten_degrees = 0.0;
 
@@ -1998,11 +2058,20 @@ fn page_geometry_edits(paint_edits: &[PagePaintEdit]) -> PageGeometryEdits {
                 x,
                 y,
             } => {
+                let crop_rect = visual_rect_to_page_rect(
+                    NormalizedRect {
+                        height: *height,
+                        width: *width,
+                        x: *x,
+                        y: *y,
+                    },
+                    source_rotation,
+                );
                 crop = Some(PageCrop {
-                    height: *height,
-                    width: *width,
-                    x: *x,
-                    y: *y,
+                    height: crop_rect.height,
+                    width: crop_rect.width,
+                    x: crop_rect.x,
+                    y: crop_rect.y,
                 });
             }
             PagePaintEdit::Straighten { degrees } => {
@@ -2022,6 +2091,7 @@ fn append_paint_edits_to_page(
     output_document: &mut LopdfDocument,
     page_dictionary: &mut Dictionary,
     paint_edits: &[PagePaintEdit],
+    source_rotation: u16,
 ) -> Result<(), AppError> {
     if paint_edits.is_empty() {
         return Ok(());
@@ -2047,7 +2117,7 @@ fn append_paint_edits_to_page(
         None
     };
 
-    let content = paint_edits_content(paint_edits, page_box, paint_fonts.as_ref());
+    let content = paint_edits_content(paint_edits, page_box, paint_fonts.as_ref(), source_rotation);
     if content.trim().is_empty() {
         return Ok(());
     }
@@ -2063,6 +2133,7 @@ fn paint_edits_content(
     paint_edits: &[PagePaintEdit],
     page_box: PageBox,
     paint_fonts: Option<&PaintFontResources>,
+    source_rotation: u16,
 ) -> String {
     let mut content = String::new();
 
@@ -2076,10 +2147,20 @@ fn paint_edits_content(
                 y,
             } => {
                 let (r, g, b) = parse_pdf_rgb(color, (1.0, 1.0, 1.0));
-                let rect_x = page_box.x1 + normalized_to_page(*x, page_box.width);
-                let rect_width = normalized_to_page(*width, page_box.width);
-                let rect_height = normalized_to_page(*height, page_box.height);
-                let rect_y = page_box.y2 - normalized_to_page(*y, page_box.height) - rect_height;
+                let rect = visual_rect_to_page_rect(
+                    NormalizedRect {
+                        height: *height,
+                        width: *width,
+                        x: *x,
+                        y: *y,
+                    },
+                    source_rotation,
+                );
+                let rect_x = page_box.x1 + normalized_to_page(rect.x, page_box.width);
+                let rect_width = normalized_to_page(rect.width, page_box.width);
+                let rect_height = normalized_to_page(rect.height, page_box.height);
+                let rect_y =
+                    page_box.y2 - normalized_to_page(rect.y, page_box.height) - rect_height;
 
                 if rect_width <= 0.1 || rect_height <= 0.1 {
                     continue;
@@ -2120,14 +2201,18 @@ fn paint_edits_content(
                     continue;
                 };
                 let (r, g, b) = parse_pdf_rgb(color, (0.0, 0.0, 0.0));
-                let font_size = pdf_text_font_size(*font_size, &page_box);
-                let text_x = page_box.x1 + normalized_to_page(*x, page_box.width);
-                let text_width = normalized_to_page(*width, page_box.width).max(font_size * 2.0);
-                let text_height = normalized_to_page(*height, page_box.height).max(font_size * 1.2);
-                let text_top = page_box.y2 - normalized_to_page(*y, page_box.height);
+                let (visual_page_width, visual_page_height) =
+                    visual_page_size(page_box, source_rotation);
+                let font_size = pdf_text_font_size(*font_size, visual_page_height);
+                let text_x = normalized_to_page(*x, visual_page_width);
+                let text_width = normalized_to_page(*width, visual_page_width).max(font_size * 2.0);
+                let text_height =
+                    normalized_to_page(*height, visual_page_height).max(font_size * 1.2);
+                let text_top = normalized_to_page(*y, visual_page_height);
                 let line_height = font_size * 1.2;
                 let max_lines = (text_height / line_height).floor().max(1.0) as usize;
                 let lines = wrap_pdf_text(text, text_width, font_size, max_lines, font);
+                let (visual_right, visual_up) = visual_text_basis(page_box, source_rotation);
 
                 content.push_str("q\nBT\n");
                 content.push_str(&format!(
@@ -2140,7 +2225,6 @@ fn paint_edits_content(
                 ));
 
                 for (line_index, line) in lines.iter().enumerate() {
-                    let line_y = text_top - font_size - line_height * line_index as f64;
                     let line_width = pdf_text_line_width(line, font_size, font).min(text_width);
                     let line_x = match text_align.as_str() {
                         "center" => text_x + (text_width - line_width) / 2.0,
@@ -2151,21 +2235,44 @@ fn paint_edits_content(
                     if encoded_text.is_empty() {
                         continue;
                     }
+                    let baseline_y = text_top + font_size + line_height * line_index as f64;
+                    let baseline = visual_pdf_point_to_page_pdf_point(
+                        page_box,
+                        source_rotation,
+                        line_x,
+                        baseline_y,
+                    );
                     content.push_str(&format!(
-                        "1 0 0 1 {} {} Tm\n<{}> Tj\n",
-                        pdf_float(line_x),
-                        pdf_float(line_y),
+                        "{} {} {} {} {} {} Tm\n<{}> Tj\n",
+                        pdf_float(visual_right.x),
+                        pdf_float(visual_right.y),
+                        pdf_float(visual_up.x),
+                        pdf_float(visual_up.y),
+                        pdf_float(baseline.x),
+                        pdf_float(baseline.y),
                         encoded_text
                     ));
 
                     if *underline {
-                        let underline_y = line_y - font_size * 0.18;
+                        let underline_y = baseline_y + font_size * 0.18;
+                        let underline_start = visual_pdf_point_to_page_pdf_point(
+                            page_box,
+                            source_rotation,
+                            line_x,
+                            underline_y,
+                        );
+                        let underline_end = visual_pdf_point_to_page_pdf_point(
+                            page_box,
+                            source_rotation,
+                            line_x + line_width,
+                            underline_y,
+                        );
                         content.push_str(&format!(
                             "ET\n{} {} m\n{} {} l\n{} w\nS\nBT\n/{} {} Tf\n{} {} {} rg\n",
-                            pdf_float(line_x),
-                            pdf_float(underline_y),
-                            pdf_float(line_x + line_width),
-                            pdf_float(underline_y),
+                            pdf_float(underline_start.x),
+                            pdf_float(underline_start.y),
+                            pdf_float(underline_end.x),
+                            pdf_float(underline_end.y),
                             pdf_float((font_size / 14.0).clamp(0.6, 2.0)),
                             font.resource_key.as_str(),
                             pdf_float(font_size),
@@ -2277,9 +2384,9 @@ fn pdf_text_line_width(text: &str, font_size: f64, font: &PdfUnicodeFont) -> f64
         .sum()
 }
 
-fn pdf_text_font_size(visual_font_size: f64, page_box: &PageBox) -> f64 {
+fn pdf_text_font_size(visual_font_size: f64, visual_page_height: f64) -> f64 {
     let visual_font_size = visual_font_size.clamp(6.0, 96.0);
-    let scale = (page_box.height / 842.0).clamp(0.45, 8.0);
+    let scale = (visual_page_height / 842.0).clamp(0.45, 8.0);
     (visual_font_size * scale).clamp(4.0, 360.0)
 }
 
@@ -2721,6 +2828,115 @@ fn normalized_to_page(value: f64, page_size: f64) -> f64 {
     value.clamp(0.0, 1.0) * page_size
 }
 
+fn normalize_pdf_rotation(rotation: i64) -> u16 {
+    match rotation.rem_euclid(360) {
+        90 => 90,
+        180 => 180,
+        270 => 270,
+        _ => 0,
+    }
+}
+
+fn page_rotation(page_dictionary: &Dictionary) -> u16 {
+    page_dictionary
+        .get(b"Rotate")
+        .and_then(Object::as_i64)
+        .map(normalize_pdf_rotation)
+        .unwrap_or(0)
+}
+
+fn visual_point_to_page_point(point: NormalizedPoint, rotation: u16) -> NormalizedPoint {
+    match rotation % 360 {
+        90 => NormalizedPoint {
+            x: point.y,
+            y: 1.0 - point.x,
+        },
+        180 => NormalizedPoint {
+            x: 1.0 - point.x,
+            y: 1.0 - point.y,
+        },
+        270 => NormalizedPoint {
+            x: 1.0 - point.y,
+            y: point.x,
+        },
+        _ => point,
+    }
+}
+
+fn normalized_rect_from_points(start: NormalizedPoint, end: NormalizedPoint) -> NormalizedRect {
+    let x = start.x.min(end.x);
+    let y = start.y.min(end.y);
+
+    NormalizedRect {
+        height: (end.y - start.y).abs(),
+        width: (end.x - start.x).abs(),
+        x,
+        y,
+    }
+}
+
+fn visual_rect_to_page_rect(rect: NormalizedRect, rotation: u16) -> NormalizedRect {
+    let start = visual_point_to_page_point(
+        NormalizedPoint {
+            x: rect.x,
+            y: rect.y,
+        },
+        rotation,
+    );
+    let end = visual_point_to_page_point(
+        NormalizedPoint {
+            x: rect.x + rect.width,
+            y: rect.y + rect.height,
+        },
+        rotation,
+    );
+
+    normalized_rect_from_points(start, end)
+}
+
+fn visual_page_size(page_box: PageBox, rotation: u16) -> (f64, f64) {
+    match rotation % 360 {
+        90 | 270 => (page_box.height.max(0.1), page_box.width.max(0.1)),
+        _ => (page_box.width.max(0.1), page_box.height.max(0.1)),
+    }
+}
+
+fn visual_pdf_point_to_page_pdf_point(
+    page_box: PageBox,
+    rotation: u16,
+    visual_x: f64,
+    visual_y: f64,
+) -> PdfPoint {
+    let (visual_page_width, visual_page_height) = visual_page_size(page_box, rotation);
+    let visual_point = NormalizedPoint {
+        x: (visual_x / visual_page_width).clamp(0.0, 1.0),
+        y: (visual_y / visual_page_height).clamp(0.0, 1.0),
+    };
+    let page_point = visual_point_to_page_point(visual_point, rotation);
+
+    PdfPoint {
+        x: page_box.x1 + normalized_to_page(page_point.x, page_box.width),
+        y: page_box.y2 - normalized_to_page(page_point.y, page_box.height),
+    }
+}
+
+fn visual_text_basis(page_box: PageBox, rotation: u16) -> (PdfPoint, PdfPoint) {
+    let origin = visual_pdf_point_to_page_pdf_point(page_box, rotation, 0.0, 0.0);
+    let right = visual_pdf_point_to_page_pdf_point(page_box, rotation, 1.0, 0.0);
+    let down = visual_pdf_point_to_page_pdf_point(page_box, rotation, 0.0, 1.0);
+
+    (
+        PdfPoint {
+            x: right.x - origin.x,
+            y: right.y - origin.y,
+        },
+        PdfPoint {
+            x: origin.x - down.x,
+            y: origin.y - down.y,
+        },
+    )
+}
+
 fn parse_pdf_rgb(value: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
     let hex = value.trim().trim_start_matches('#');
     if hex.len() != 6 {
@@ -2754,12 +2970,12 @@ fn apply_page_rotation(page_dictionary: &mut Dictionary, rotation: u16) {
         .get(b"Rotate")
         .and_then(Object::as_i64)
         .unwrap_or(0);
-    let next_rotation = (current_rotation + i64::from(rotation)).rem_euclid(360);
+    let next_rotation = normalize_pdf_rotation(current_rotation + i64::from(rotation));
 
     if next_rotation == 0 {
         page_dictionary.remove(b"Rotate");
     } else {
-        page_dictionary.set("Rotate", next_rotation);
+        page_dictionary.set("Rotate", i64::from(next_rotation));
     }
 }
 
@@ -3107,6 +3323,29 @@ fn is_supported_image(path: &Path) -> bool {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let paths: Vec<String> = args
+                .iter()
+                .filter_map(|argument| {
+                    let path = PathBuf::from(argument);
+                    if path.is_file() && is_pdf(&path) {
+                        Some(path.to_string_lossy().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if paths.is_empty() {
+                return;
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+
+            let _ = app.emit(OPEN_PDF_PATHS_EVENT, OpenPdfPathsPayload { paths });
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -3115,6 +3354,8 @@ pub fn run() {
             minimize_main_window,
             open_folder,
             read_pdf_metadata,
+            read_startup_pdf_path,
+            read_startup_pdf_paths,
             read_insert_pages,
             render_pdf_pages,
             sample_image_color,
@@ -3213,10 +3454,55 @@ mod tests {
             ],
             page_box,
             None,
+            0,
         );
 
         assert!(content.contains("120 50 40 600 re"));
         assert!(content.contains("480 50 40 600 re"));
+    }
+
+    #[test]
+    fn paint_cover_rectangles_follow_source_rotation() {
+        let page_box = PageBox {
+            height: 600.0,
+            width: 400.0,
+            x1: 0.0,
+            y1: 0.0,
+            y2: 600.0,
+        };
+        let content = paint_edits_content(
+            &[PagePaintEdit::Cover {
+                color: "#00ff00".to_string(),
+                height: 0.2,
+                width: 0.1,
+                x: 0.0,
+                y: 0.0,
+            }],
+            page_box,
+            None,
+            90,
+        );
+
+        assert!(content.contains("0 0 80 60 re"));
+    }
+
+    #[test]
+    fn crop_rectangles_follow_source_rotation() {
+        let geometry = page_geometry_edits(
+            &[PagePaintEdit::Crop {
+                height: 0.2,
+                width: 0.1,
+                x: 0.0,
+                y: 0.0,
+            }],
+            90,
+        );
+        let crop = geometry.crop.expect("crop edit");
+
+        assert!((crop.x - 0.0).abs() < 0.0001);
+        assert!((crop.y - 0.9).abs() < 0.0001);
+        assert!((crop.width - 0.2).abs() < 0.0001);
+        assert!((crop.height - 0.1).abs() < 0.0001);
     }
 
     #[test]
@@ -3263,10 +3549,60 @@ mod tests {
             }],
             page_box,
             Some(&resources),
+            0,
         );
 
         assert!(content.contains("/SPFTest 26 Tf"));
         assert!(content.contains("<00020003> Tj"));
+    }
+
+    #[test]
+    fn paint_text_uses_visual_basis_for_source_rotation() {
+        let mut cid_by_char = HashMap::new();
+        cid_by_char.insert('A', 1);
+        let mut width_by_cid = HashMap::new();
+        width_by_cid.insert(1, 520.0);
+        let mut fonts = HashMap::new();
+        fonts.insert(
+            PaintFontStyle::Regular,
+            PdfUnicodeFont {
+                cid_by_char,
+                resource_key: "SPFTest".to_string(),
+                width_by_cid,
+            },
+        );
+        let resources = PaintFontResources { fonts };
+        let page_box = PageBox {
+            height: 600.0,
+            width: 400.0,
+            x1: 0.0,
+            y1: 0.0,
+            y2: 600.0,
+        };
+        let content = paint_edits_content(
+            &[PagePaintEdit::Text {
+                bold: false,
+                color: "#111827".to_string(),
+                font_family: "Arial".to_string(),
+                font_size: 12.0,
+                height: 0.1,
+                italic: false,
+                text_align: "left".to_string(),
+                text: "A".to_string(),
+                underline: true,
+                width: 0.2,
+                x: 0.1,
+                y: 0.1,
+            }],
+            page_box,
+            Some(&resources),
+            90,
+        );
+
+        assert!(content.contains("0 1 -1 0"));
+        assert!(content.contains("<0001> Tj"));
+        assert!(content.contains(" m\n"));
+        assert!(content.contains(" l\n"));
     }
 
     #[test]

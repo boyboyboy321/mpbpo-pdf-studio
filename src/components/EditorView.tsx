@@ -1,5 +1,4 @@
 import {
-  ArrowLeft,
   AlignCenter,
   AlignLeft,
   AlignRight,
@@ -33,6 +32,7 @@ import {
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { exit } from "@tauri-apps/plugin-process";
 import {
   startTransition,
   useCallback,
@@ -44,6 +44,7 @@ import {
   type Dispatch,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   type WheelEvent as ReactWheelEvent,
 } from "react";
 
@@ -84,11 +85,23 @@ import { formatBytes } from "../utils/format";
 import { PageGrid } from "./PageGrid";
 
 interface EditorViewProps {
+  busyJob: EditorFileWriteJob | null;
   document: PdfDocument;
   dispatch: Dispatch<DocumentAction>;
+  guardWindowClose?: boolean;
   isFileDragging: boolean;
   loadState: PdfLoadState;
+  tabId: string;
+  onBeginBusyJob: (job: EditorFileWriteJob) => boolean;
+  onEndBusyJob: (jobId: string) => void;
   onPickPdf: () => void;
+}
+
+interface EditorFileWriteJob {
+  fileName: string;
+  id: string;
+  kind: "save" | "split";
+  tabId: string;
 }
 
 interface HoverState {
@@ -118,6 +131,11 @@ type DetailTool = "cover" | "crop" | "hand" | "straighten" | "text";
 interface DraftCoverRect {
   height: number;
   width: number;
+  x: number;
+  y: number;
+}
+
+interface NormalizedPoint {
   x: number;
   y: number;
 }
@@ -191,7 +209,18 @@ function getSplitOutputOption(mode: SplitOutputMode) {
   return SPLIT_OUTPUT_OPTIONS[mode];
 }
 
-export function EditorView({ document, dispatch, isFileDragging, loadState, onPickPdf }: EditorViewProps) {
+export function EditorView({
+  busyJob,
+  document,
+  dispatch,
+  guardWindowClose = true,
+  isFileDragging,
+  loadState,
+  onBeginBusyJob,
+  onEndBusyJob,
+  onPickPdf,
+  tabId,
+}: EditorViewProps) {
   const hoverFrameRef = useRef<number | null>(null);
   const eachPageSplitCheckboxRef = useRef<HTMLInputElement | null>(null);
   const splitLocationMenuRef = useRef<HTMLDivElement | null>(null);
@@ -229,7 +258,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
   const totalPossibleCuts = Math.max(0, document.pages.length - 1);
   const isEachPageSplit = totalPossibleCuts > 0 && sortedCuts.length === totalPossibleCuts;
   const isPartialEachPageSplit = sortedCuts.length > 0 && !isEachPageSplit;
-  const canSplit = Boolean(document.filePath) && sortedCuts.length > 0 && splitState.status !== "running";
+  const canSplit = Boolean(document.filePath) && sortedCuts.length > 0 && splitState.status !== "running" && !busyJob;
   const splitOutputOption = getSplitOutputOption(document.splitOutputMode);
   const splitOutputDescription =
     document.splitOutputMode === "customFolder" && document.splitCustomOutputFolder
@@ -253,6 +282,44 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       eachPageSplitCheckboxRef.current.indeterminate = isPartialEachPageSplit;
     }
   }, [isPartialEachPageSplit]);
+
+  useEffect(() => {
+    const hasDismissableToast =
+      splitState.status === "success" ||
+      splitState.status === "error" ||
+      saveState.status === "success" ||
+      saveState.status === "error";
+
+    if (!settingsOpen && !hasDismissableToast) {
+      return;
+    }
+
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) {
+        return;
+      }
+
+      if (target.closest(".render-settings-panel, .panel-toggle, .split-toast, .confirm-dialog, .split-location-picker")) {
+        return;
+      }
+
+      if (settingsOpen) {
+        setSettingsOpen(false);
+      }
+
+      if (splitState.status === "success" || splitState.status === "error") {
+        setSplitState({ status: "idle" });
+      }
+
+      if (saveState.status === "success" || saveState.status === "error") {
+        setSaveState({ status: "idle" });
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown, true);
+    return () => window.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [saveState.status, settingsOpen, splitState.status]);
 
   useEffect(() => {
     splitRunningRef.current = splitState.status === "running";
@@ -643,6 +710,10 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
   }, [document.isDirty]);
 
   useEffect(() => {
+    if (!guardWindowClose) {
+      return;
+    }
+
     let isDisposed = false;
     let unlistenClose: (() => void) | null = null;
 
@@ -673,7 +744,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       isDisposed = true;
       unlistenClose?.();
     };
-  }, [document.isDirty]);
+  }, [document.isDirty, guardWindowClose]);
 
   const handleOpenSplitOutputDir = useCallback(async (outputDir: string) => {
     try {
@@ -693,6 +764,17 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       return true;
     }
 
+    if (busyJob) {
+      setSaveState({ status: "error", message: getBusyJobMessage(busyJob, "save") });
+      return false;
+    }
+
+    const jobId = createSplitRunId();
+    if (!onBeginBusyJob({ fileName: document.fileName, id: jobId, kind: "save", tabId })) {
+      setSaveState({ status: "error", message: "Another PDF is being saved or split. Please wait." });
+      return false;
+    }
+
     setSaveState({ status: "running" });
 
     try {
@@ -703,6 +785,8 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
     } catch (error: unknown) {
       setSaveState({ status: "error", message: getFriendlyLoadError(error) });
       return false;
+    } finally {
+      onEndBusyJob(jobId);
     }
   }
 
@@ -712,9 +796,26 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
 
     try {
       await getCurrentWindow().close();
+      if (isTauri()) {
+        window.setTimeout(() => {
+          void exit(0).catch(() => {
+            closeBypassRef.current = false;
+          });
+        }, 160);
+      }
     } catch (error: unknown) {
-      closeBypassRef.current = false;
-      setSaveState({ status: "error", message: getFriendlyLoadError(error) });
+      if (isTauri()) {
+        try {
+          await exit(0);
+          return;
+        } catch {
+          closeBypassRef.current = false;
+          setSaveState({ status: "error", message: getFriendlyLoadError(error) });
+        }
+      } else {
+        closeBypassRef.current = false;
+        setSaveState({ status: "error", message: getFriendlyLoadError(error) });
+      }
     }
   }
 
@@ -769,12 +870,6 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   });
-
-  function handleCloseDocument() {
-    if (!document.isDirty || window.confirm("This file has unsaved changes. Discard them and continue?")) {
-      dispatch({ type: "close" });
-    }
-  }
 
   function handlePickPdf() {
     onPickPdf();
@@ -913,12 +1008,22 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       return;
     }
 
+    if (busyJob) {
+      setSplitState({ status: "error", message: getBusyJobMessage(busyJob, "split") });
+      return;
+    }
+
     const outputOptions = await resolveSplitOutputOptions();
     if (!outputOptions) {
       return;
     }
 
     const runId = createSplitRunId();
+    if (!onBeginBusyJob({ fileName: document.fileName, id: runId, kind: "split", tabId })) {
+      setSplitState({ status: "error", message: "Another PDF is being saved or split. Please wait." });
+      return;
+    }
+
     setSplitState({ status: "running", completedFiles: 0, runId, totalFiles: sortedCuts.length + 1 });
 
     try {
@@ -926,18 +1031,15 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
       setSplitState({ status: "success", result });
     } catch (error) {
       setSplitState({ status: "error", message: getFriendlyLoadError(error) });
+    } finally {
+      onEndBusyJob(runId);
     }
   }
 
   return (
     <main className="editor-shell">
       <header className="editor-topbar">
-        <button className="icon-text-button" type="button" onClick={handleCloseDocument}>
-          <ArrowLeft size={18} />
-          Home
-        </button>
-        <div className="document-title">
-          <strong>{document.isDirty ? `*${document.fileName}` : document.fileName}</strong>
+        <div className="document-title is-compact">
           <span>
             {document.pages.length} pages - {formatBytes(document.sizeBytes)}
             {saveState.status === "error" ? ` - ${saveState.message}` : null}
@@ -949,7 +1051,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
             <FolderOpen size={18} />
             Open
           </button>
-          <button className="primary-action compact" type="button" disabled={!document.isDirty || saveState.status === "running"} onClick={() => void saveCurrentDocument()}>
+          <button className="primary-action compact" type="button" disabled={!document.isDirty || saveState.status === "running" || Boolean(busyJob)} onClick={() => void saveCurrentDocument()}>
             <Save size={18} />
             {saveState.status === "running" ? "Saving..." : "Save"}
           </button>
@@ -993,30 +1095,6 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
         </aside>
 
         <section className="page-workspace">
-          <div className="workspace-toolbar">
-            <div className="cut-status">
-              <Scissors size={18} />
-              <span>
-                {loadState.status === "loading"
-                  ? loadState.message
-                  : "Edit pages and click lines between pages to split. Ctrl+S saves to the original file."}
-              </span>
-            </div>
-            <div className="workspace-controls">
-              <label className="scale-control">
-                Thumbnail
-                <input
-                  min={THUMBNAIL_SCALE_MIN}
-                  max={THUMBNAIL_SCALE_MAX}
-                  step={THUMBNAIL_SCALE_STEP}
-                  type="range"
-                  value={document.thumbnailScale}
-                  onChange={(event) => dispatch({ type: "set-thumbnail-scale", scale: Number(event.currentTarget.value) })}
-                />
-              </label>
-            </div>
-          </div>
-
           <PageGrid
             document={document}
             dispatch={dispatch}
@@ -1051,6 +1129,17 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
         {document.detailPanelVisible ? (
           <aside className="detail-panel">
             <div className="detail-panel-header">
+              <label className="scale-control is-panel">
+                Thumbnail
+                <input
+                  min={THUMBNAIL_SCALE_MIN}
+                  max={THUMBNAIL_SCALE_MAX}
+                  step={THUMBNAIL_SCALE_STEP}
+                  type="range"
+                  value={document.thumbnailScale}
+                  onChange={(event) => dispatch({ type: "set-thumbnail-scale", scale: Number(event.currentTarget.value) })}
+                />
+              </label>
               <button
                 className={`panel-toggle ${settingsOpen ? "is-active" : ""}`}
                 type="button"
@@ -1120,6 +1209,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
                     aria-haspopup="menu"
                     aria-labelledby="split-output-mode-label"
                     disabled={splitState.status === "running"}
+                    title={`${splitOutputOption.label}: ${splitOutputDescription}`}
                     onClick={() => setSplitLocationMenuOpen((isOpen) => !isOpen)}
                   >
                     <span className="split-location-icon">
@@ -1140,6 +1230,7 @@ export function EditorView({ document, dispatch, isFileDragging, loadState, onPi
                           type="button"
                           role="menuitemradio"
                           aria-checked={option.mode === document.splitOutputMode}
+                          title={`${option.label}: ${option.description}`}
                           onClick={() => void handleSelectSplitOutputMode(option.mode)}
                         >
                           <span>
@@ -1697,6 +1788,12 @@ function createSplitRunId(): string {
   return `split-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function getBusyJobMessage(job: EditorFileWriteJob, requestedKind: "save" | "split"): string {
+  const runningAction = job.kind === "split" ? "splitting" : "saving";
+  const requestedAction = requestedKind === "split" ? "split another PDF" : "save another PDF";
+  return `${job.fileName} is ${runningAction}. Please wait before you ${requestedAction}.`;
+}
+
 function getProgressPercent(completedFiles: number, totalFiles: number): number {
   if (totalFiles <= 0) {
     return 0;
@@ -1717,7 +1814,7 @@ function createPaintEditId(): string {
   return `paint-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function normalizedRect(start: { x: number; y: number }, end: { x: number; y: number }): DraftCoverRect {
+function normalizedRect(start: NormalizedPoint, end: NormalizedPoint): DraftCoverRect {
   const x = Math.min(start.x, end.x);
   const y = Math.min(start.y, end.y);
 
@@ -1726,6 +1823,94 @@ function normalizedRect(start: { x: number; y: number }, end: { x: number; y: nu
     width: Math.abs(end.x - start.x),
     x,
     y,
+  };
+}
+
+function normalizePageRotation(rotation: number): 0 | 90 | 180 | 270 {
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+
+  if (normalizedRotation === 90 || normalizedRotation === 180 || normalizedRotation === 270) {
+    return normalizedRotation;
+  }
+
+  return 0;
+}
+
+function visualPointToPagePoint(point: NormalizedPoint, rotation: number): NormalizedPoint {
+  switch (normalizePageRotation(rotation)) {
+    case 90:
+      return { x: point.y, y: 1 - point.x };
+    case 180:
+      return { x: 1 - point.x, y: 1 - point.y };
+    case 270:
+      return { x: 1 - point.y, y: point.x };
+    default:
+      return point;
+  }
+}
+
+function pagePointToVisualPoint(point: NormalizedPoint, rotation: number): NormalizedPoint {
+  switch (normalizePageRotation(rotation)) {
+    case 90:
+      return { x: 1 - point.y, y: point.x };
+    case 180:
+      return { x: 1 - point.x, y: 1 - point.y };
+    case 270:
+      return { x: point.y, y: 1 - point.x };
+    default:
+      return point;
+  }
+}
+
+function unstraightenVisualPoint(point: NormalizedPoint, degrees: number, scale: number, ratio: number): NormalizedPoint {
+  if (Math.abs(degrees) <= DETAIL_STRAIGHTEN_EPSILON && Math.abs(scale - 1) <= DETAIL_STRAIGHTEN_EPSILON) {
+    return point;
+  }
+
+  const radians = -degrees * (Math.PI / 180);
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const width = Math.max(0.01, ratio);
+  const height = 1;
+  const dx = ((point.x - 0.5) * width) / scale;
+  const dy = ((point.y - 0.5) * height) / scale;
+
+  return {
+    x: 0.5 + (dx * cos - dy * sin) / width,
+    y: 0.5 + (dx * sin + dy * cos) / height,
+  };
+}
+
+function rectFromVisualRect(rect: DraftCoverRect, rotation: number): DraftCoverRect {
+  const start = visualPointToPagePoint({ x: rect.x, y: rect.y }, rotation);
+  const end = visualPointToPagePoint({ x: rect.x + rect.width, y: rect.y + rect.height }, rotation);
+  return normalizedRect(start, end);
+}
+
+function rectToVisualRect(rect: DraftCoverRect, rotation: number): DraftCoverRect {
+  const start = pagePointToVisualPoint({ x: rect.x, y: rect.y }, rotation);
+  const end = pagePointToVisualPoint({ x: rect.x + rect.width, y: rect.y + rect.height }, rotation);
+  return normalizedRect(start, end);
+}
+
+function rectStyle(rect: DraftCoverRect): CSSProperties {
+  return {
+    height: `${rect.height * 100}%`,
+    left: `${rect.x * 100}%`,
+    top: `${rect.y * 100}%`,
+    width: `${rect.width * 100}%`,
+  };
+}
+
+function resizeTextVisualRect(origin: DraftCoverRect, handle: TextResizeHandle, dx: number, dy: number): DraftCoverRect {
+  const nextWidth = handle === "south" ? origin.width : clamp(origin.width + dx, 0.06, 1 - origin.x);
+  const nextHeight = handle === "east" ? origin.height : clamp(origin.height + dy, 0.035, 1 - origin.y);
+
+  return {
+    height: nextHeight,
+    width: nextWidth,
+    x: origin.x,
+    y: origin.y,
   };
 }
 
@@ -1936,6 +2121,7 @@ function FullPreviewOverlay({
   const [activeTextEditId, setActiveTextEditId] = useState<string | null>(null);
   const [straightenInput, setStraightenInput] = useState("");
   const hitboxRef = useRef<HTMLDivElement | null>(null);
+  const pageFrameRef = useRef<HTMLDivElement | null>(null);
   const coverColorRef = useRef("#ffffff");
   const skipNextStraightenBlurRef = useRef(false);
   const pointerStateRef = useRef<
@@ -1943,39 +2129,39 @@ function FullPreviewOverlay({
         handle: CropResizeHandle;
         kind: "crop";
         originCrop: DraftCoverRect;
+        originVisualCrop: DraftCoverRect;
         pointerId: number;
-        start: { x: number; y: number };
+        startVisual: NormalizedPoint;
       }
     | {
         kind: "crop-draw";
         pointerId: number;
-        start: { x: number; y: number };
+        start: NormalizedPoint;
       }
     | {
         color: string;
         kind: "cover";
         pointerId: number;
-        start: { x: number; y: number };
+        start: NormalizedPoint;
       }
     | {
         kind: "text";
         pointerId: number;
-        start: { x: number; y: number };
+        start: NormalizedPoint;
       }
     | {
         edit: Extract<PdfPagePaintEdit, { type: "text" }>;
         kind: "text-move";
-        originX: number;
-        originY: number;
         pointerId: number;
+        startPoint: NormalizedPoint;
       }
     | {
         edit: Extract<PdfPagePaintEdit, { type: "text" }>;
         handle: TextResizeHandle;
         kind: "text-resize";
-        originX: number;
-        originY: number;
+        originVisualRect: DraftCoverRect;
         pointerId: number;
+        startVisual: NormalizedPoint;
       }
     | {
         kind: "text-panel-move";
@@ -2010,6 +2196,8 @@ function FullPreviewOverlay({
   const workingCrop = tool === "crop" ? (draftCrop ?? activeCrop) : activeCrop;
   const contentCrop = tool === "crop" ? FULL_CROP_RECT : activeCrop;
   const straightenDegrees = useMemo(() => getStraightenDegrees(state.page.paintEdits), [state.page.paintEdits]);
+  const displayRatioValue = state.preview ? adjustedPreviewRatio(state.page, state.preview) : 1;
+  const straightenScale = getStraightenScale(straightenDegrees, displayRatioValue);
 
   useEffect(() => {
     setPageInput(currentPageText);
@@ -2054,6 +2242,44 @@ function FullPreviewOverlay({
   useEffect(() => {
     const handlePreviewKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
+      const isTyping = isTypingTarget(event.target);
+
+      if (!isTyping && event.key === "Escape") {
+        event.preventDefault();
+        if (tool !== "hand") {
+          chooseTool("hand");
+        } else {
+          closePreview();
+        }
+        return;
+      }
+
+      if (!isTyping && event.code === "Space") {
+        event.preventDefault();
+        return;
+      }
+
+      if (!isTyping && event.key === "ArrowLeft") {
+        event.preventDefault();
+        if (canGoPrevious) {
+          goToPage(state.page.pageNumber - 1);
+        }
+        return;
+      }
+
+      if (!isTyping && event.key === "ArrowRight") {
+        event.preventDefault();
+        if (canGoNext) {
+          goToPage(state.page.pageNumber + 1);
+        }
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && key === "r") {
+        event.preventDefault();
+        onRotateClockwise(state.page.pageNumber);
+        return;
+      }
 
       if ((event.ctrlKey || event.metaKey) && key === "p") {
         event.preventDefault();
@@ -2061,7 +2287,7 @@ function FullPreviewOverlay({
         return;
       }
 
-      if (!event.ctrlKey && !event.metaKey && !event.altKey && !isTypingTarget(event.target) && key === "p") {
+      if (!event.ctrlKey && !event.metaKey && !event.altKey && !isTyping && key === "p") {
         event.preventDefault();
         void handlePickCoverColor();
         return;
@@ -2086,19 +2312,13 @@ function FullPreviewOverlay({
         return;
       }
 
-      if (tool === "crop" && event.key === "Enter" && !isTypingTarget(event.target)) {
+      if (tool === "crop" && event.key === "Enter" && !isTyping) {
         event.preventDefault();
         commitPendingCrop();
         return;
       }
 
-      if (event.code === "Space" && !isTypingTarget(event.target)) {
-        event.preventDefault();
-        chooseTool("hand");
-        return;
-      }
-
-      if (!event.ctrlKey && !event.metaKey && !event.altKey && !isTypingTarget(event.target)) {
+      if (!event.ctrlKey && !event.metaKey && !event.altKey && !isTyping) {
         if (key === "c") {
           event.preventDefault();
           chooseTool("crop");
@@ -2108,7 +2328,7 @@ function FullPreviewOverlay({
 
     window.addEventListener("keydown", handlePreviewKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handlePreviewKeyDown, { capture: true });
-  }, [activeCrop, activeTextEdit, draftCrop, onUndoPaintEdit, state.page.pageNumber, tool]);
+  }, [activeCrop, activeTextEdit, canGoNext, canGoPrevious, draftCrop, onRotateClockwise, onUndoPaintEdit, state.page.pageNumber, tool]);
 
   function commitPageInput() {
     const parsedPage = Number.parseInt(pageInput, 10);
@@ -2256,35 +2476,39 @@ function FullPreviewOverlay({
     onPageChange(pageNumber);
   }
 
-  function getRawNormalizedPointFromClient(clientX: number, clientY: number): { x: number; y: number } | null {
-    const bounds = hitboxRef.current?.getBoundingClientRect();
+  function getVisualPointFromClient(clientX: number, clientY: number): NormalizedPoint | null {
+    const bounds = pageFrameRef.current?.getBoundingClientRect();
     if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
       return null;
     }
 
-    const localX = (clientX - bounds.left - pan.x) / zoom;
-    const localY = (clientY - bounds.top - pan.y) / zoom;
+    const point = {
+      x: clamp((clientX - bounds.left) / bounds.width, 0, 1),
+      y: clamp((clientY - bounds.top) / bounds.height, 0, 1),
+    };
 
+    const unstraightenedPoint = unstraightenVisualPoint(point, straightenDegrees, straightenScale, displayRatioValue);
     return {
-      x: localX / bounds.width,
-      y: localY / bounds.height,
+      x: clamp(unstraightenedPoint.x, 0, 1),
+      y: clamp(unstraightenedPoint.y, 0, 1),
     };
   }
 
-  function getNormalizedPointFromClient(clientX: number, clientY: number): { x: number; y: number } | null {
-    const point = getRawNormalizedPointFromClient(clientX, clientY);
+  function getPagePointFromClient(clientX: number, clientY: number): NormalizedPoint | null {
+    const point = getVisualPointFromClient(clientX, clientY);
     if (!point) {
       return null;
     }
 
-    return {
-      x: clamp(point.x, 0, 1),
-      y: clamp(point.y, 0, 1),
-    };
+    return visualPointToPagePoint(point, state.page.rotation);
   }
 
-  function getNormalizedPoint(event: ReactPointerEvent<HTMLElement>): { x: number; y: number } | null {
-    return getNormalizedPointFromClient(event.clientX, event.clientY);
+  function getPagePoint(event: ReactPointerEvent<HTMLElement>): NormalizedPoint | null {
+    return getPagePointFromClient(event.clientX, event.clientY);
+  }
+
+  function getVisualPoint(event: ReactPointerEvent<HTMLElement>): NormalizedPoint | null {
+    return getVisualPointFromClient(event.clientX, event.clientY);
   }
 
   function setCustomCoverColor(color: string) {
@@ -2343,7 +2567,7 @@ function FullPreviewOverlay({
     }
 
     if (tool === "text") {
-      const start = getNormalizedPoint(event);
+      const start = getPagePoint(event);
       if (!start) {
         return;
       }
@@ -2354,7 +2578,7 @@ function FullPreviewOverlay({
     }
 
     if (tool === "cover") {
-      const start = getNormalizedPoint(event);
+      const start = getPagePoint(event);
       if (!start) {
         return;
       }
@@ -2370,7 +2594,7 @@ function FullPreviewOverlay({
     }
 
     if (tool === "crop") {
-      const start = getNormalizedPoint(event);
+      const start = getPagePoint(event);
       if (!start) {
         return;
       }
@@ -2402,7 +2626,7 @@ function FullPreviewOverlay({
     event.stopPropagation();
 
     if (pointerState.kind === "cover") {
-      const point = getNormalizedPoint(event);
+      const point = getPagePoint(event);
       if (point) {
         setDraftCover(normalizedRect(pointerState.start, point));
       }
@@ -2410,7 +2634,7 @@ function FullPreviewOverlay({
     }
 
     if (pointerState.kind === "crop-draw") {
-      const point = getNormalizedPoint(event);
+      const point = getPagePoint(event);
       if (point) {
         setDraftCrop(clampCropRect(normalizedRect(pointerState.start, point)));
       }
@@ -2418,17 +2642,18 @@ function FullPreviewOverlay({
     }
 
     if (pointerState.kind === "crop") {
-      const point = getNormalizedPoint(event);
+      const point = getVisualPoint(event);
       if (point) {
-        const dx = point.x - pointerState.start.x;
-        const dy = point.y - pointerState.start.y;
-        setDraftCrop(resizeCropRect(pointerState.originCrop, pointerState.handle, dx, dy));
+        const dx = point.x - pointerState.startVisual.x;
+        const dy = point.y - pointerState.startVisual.y;
+        const visualCrop = resizeCropRect(pointerState.originVisualCrop, pointerState.handle, dx, dy);
+        setDraftCrop(clampCropRect(rectFromVisualRect(visualCrop, state.page.rotation)));
       }
       return;
     }
 
     if (pointerState.kind === "text") {
-      const point = getNormalizedPoint(event);
+      const point = getPagePoint(event);
       if (point) {
         setDraftTextRect(normalizedRect(pointerState.start, point));
       }
@@ -2436,39 +2661,34 @@ function FullPreviewOverlay({
     }
 
     if (pointerState.kind === "text-move") {
-      const bounds = hitboxRef.current?.getBoundingClientRect();
-      if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
-        return;
+      const point = getPagePoint(event);
+      if (point) {
+        const dx = point.x - pointerState.startPoint.x;
+        const dy = point.y - pointerState.startPoint.y;
+        updateTextEdit({
+          ...pointerState.edit,
+          x: clamp(pointerState.edit.x + dx, 0, 1 - pointerState.edit.width),
+          y: clamp(pointerState.edit.y + dy, 0, 1 - pointerState.edit.height),
+        });
       }
-
-      const dx = (event.clientX - pointerState.originX) / (bounds.width * zoom);
-      const dy = (event.clientY - pointerState.originY) / (bounds.height * zoom);
-      updateTextEdit({
-        ...pointerState.edit,
-        x: clamp(pointerState.edit.x + dx, 0, 1 - pointerState.edit.width),
-        y: clamp(pointerState.edit.y + dy, 0, 1 - pointerState.edit.height),
-      });
       return;
     }
 
     if (pointerState.kind === "text-resize") {
-      const bounds = hitboxRef.current?.getBoundingClientRect();
-      if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
-        return;
+      const point = getVisualPoint(event);
+      if (point) {
+        const dx = point.x - pointerState.startVisual.x;
+        const dy = point.y - pointerState.startVisual.y;
+        const nextVisualRect = resizeTextVisualRect(pointerState.originVisualRect, pointerState.handle, dx, dy);
+        const nextPageRect = rectFromVisualRect(nextVisualRect, state.page.rotation);
+        updateTextEdit({
+          ...pointerState.edit,
+          height: nextPageRect.height,
+          width: nextPageRect.width,
+          x: clamp(nextPageRect.x, 0, 1 - nextPageRect.width),
+          y: clamp(nextPageRect.y, 0, 1 - nextPageRect.height),
+        });
       }
-
-      const dx = (event.clientX - pointerState.originX) / (bounds.width * zoom);
-      const dy = (event.clientY - pointerState.originY) / (bounds.height * zoom);
-      const nextWidth =
-        pointerState.handle === "south" ? pointerState.edit.width : clamp(pointerState.edit.width + dx, 0.06, 1 - pointerState.edit.x);
-      const nextHeight =
-        pointerState.handle === "east" ? pointerState.edit.height : clamp(pointerState.edit.height + dy, 0.035, 1 - pointerState.edit.y);
-
-      updateTextEdit({
-        ...pointerState.edit,
-        height: nextHeight,
-        width: nextWidth,
-      });
       return;
     }
 
@@ -2511,7 +2731,7 @@ function FullPreviewOverlay({
     pointerStateRef.current = null;
 
     if (pointerState.kind === "cover") {
-      const end = getNormalizedPoint(event) ?? pointerState.start;
+      const end = getPagePoint(event) ?? pointerState.start;
       const rect = normalizedRect(pointerState.start, end);
       setDraftCover(null);
 
@@ -2530,7 +2750,7 @@ function FullPreviewOverlay({
     }
 
     if (pointerState.kind === "crop-draw") {
-      const end = getNormalizedPoint(event) ?? pointerState.start;
+      const end = getPagePoint(event) ?? pointerState.start;
       const rect = clampCropRect(normalizedRect(pointerState.start, end));
 
       if (rect.width >= DETAIL_MIN_CROP_SIZE && rect.height >= DETAIL_MIN_CROP_SIZE) {
@@ -2542,16 +2762,16 @@ function FullPreviewOverlay({
     }
 
     if (pointerState.kind === "crop") {
-      const point = getNormalizedPoint(event) ?? pointerState.start;
-      const dx = point.x - pointerState.start.x;
-      const dy = point.y - pointerState.start.y;
-      const rect = resizeCropRect(pointerState.originCrop, pointerState.handle, dx, dy);
-      setDraftCrop(rect);
+      const point = getVisualPoint(event) ?? pointerState.startVisual;
+      const dx = point.x - pointerState.startVisual.x;
+      const dy = point.y - pointerState.startVisual.y;
+      const visualCrop = resizeCropRect(pointerState.originVisualCrop, pointerState.handle, dx, dy);
+      setDraftCrop(clampCropRect(rectFromVisualRect(visualCrop, state.page.rotation)));
       return;
     }
 
     if (pointerState.kind === "text") {
-      const end = getNormalizedPoint(event) ?? pointerState.start;
+      const end = getPagePoint(event) ?? pointerState.start;
       const rect = normalizedRect(pointerState.start, end);
       setDraftTextRect(null);
 
@@ -2591,12 +2811,12 @@ function FullPreviewOverlay({
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     setActiveTextEditId(edit.id);
+    const startPoint = getPagePoint(event) ?? { x: edit.x, y: edit.y };
     pointerStateRef.current = {
       edit,
       kind: "text-move",
-      originX: event.clientX,
-      originY: event.clientY,
       pointerId: event.pointerId,
+      startPoint,
     };
   }
 
@@ -2609,13 +2829,15 @@ function FullPreviewOverlay({
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     setActiveTextEditId(edit.id);
+    const originVisualRect = rectToVisualRect(edit, state.page.rotation);
+    const startVisual = getVisualPoint(event) ?? { x: originVisualRect.x + originVisualRect.width, y: originVisualRect.y + originVisualRect.height };
     pointerStateRef.current = {
       edit,
       handle,
       kind: "text-resize",
-      originX: event.clientX,
-      originY: event.clientY,
+      originVisualRect,
       pointerId: event.pointerId,
+      startVisual,
     };
   }
 
@@ -2654,13 +2876,15 @@ function FullPreviewOverlay({
     discardActiveEmptyTextEdit();
     setTool("crop");
     const originCrop = draftCrop ?? activeCrop;
-    const start = getNormalizedPoint(event) ?? { x: originCrop.x, y: originCrop.y };
+    const originVisualCrop = rectToVisualRect(originCrop, state.page.rotation);
+    const startVisual = getVisualPoint(event) ?? { x: originVisualCrop.x, y: originVisualCrop.y };
     pointerStateRef.current = {
       handle,
       kind: "crop",
       originCrop,
+      originVisualCrop,
       pointerId: event.pointerId,
-      start,
+      startVisual,
     };
     setDraftCrop(originCrop);
   }
@@ -2874,6 +3098,7 @@ function FullPreviewOverlay({
                 draftCover={draftCover}
                 draftCoverColor={coverColor}
                 page={state.page}
+                pageRef={pageFrameRef}
                 pan={pan}
                 preview={state.preview}
                 activeTextEditId={activeTextEditId}
@@ -2953,6 +3178,7 @@ function EditablePreviewImage({
   onResizeTextBoxStart,
   onTextChange,
   page,
+  pageRef,
   pan,
   preview,
   straightenDegrees,
@@ -2976,6 +3202,7 @@ function EditablePreviewImage({
   ) => void;
   onTextChange: (edit: Extract<PdfPagePaintEdit, { type: "text" }>, text: string) => void;
   page: PdfPage;
+  pageRef: RefObject<HTMLDivElement | null>;
   pan: { x: number; y: number };
   preview: PdfPagePreview;
   straightenDegrees: number;
@@ -2988,20 +3215,24 @@ function EditablePreviewImage({
   const displayRatio = isSideways ? `${preview.height} / ${preview.width}` : `${preview.width} / ${preview.height}`;
   const straightenScale = getStraightenScale(straightenDegrees, displayRatioValue);
   const hasCommittedCrop = !isSameCropRect(committedCrop, FULL_CROP_RECT);
+  const visualActiveCrop = rectToVisualRect(activeCrop, page.rotation);
+  const visualCommittedCrop = rectToVisualRect(committedCrop, page.rotation);
+  const visualEditingCrop = rectToVisualRect(editingCrop, page.rotation);
 
   return (
     <div
       className={`editable-preview-page ${isSideways ? "is-sideways" : ""} is-tool-${tool}`}
+      ref={pageRef}
       style={
         {
           "--page-ratio": displayRatio,
           "--page-ratio-value": displayRatioValue,
           "--source-ratio": sourceRatio,
           "--rotation": `${page.rotation}deg`,
-          "--crop-bottom": `${(1 - activeCrop.y - activeCrop.height) * 100}%`,
-          "--crop-left": `${activeCrop.x * 100}%`,
-          "--crop-right": `${(1 - activeCrop.x - activeCrop.width) * 100}%`,
-          "--crop-top": `${activeCrop.y * 100}%`,
+          "--crop-bottom": `${(1 - visualActiveCrop.y - visualActiveCrop.height) * 100}%`,
+          "--crop-left": `${visualActiveCrop.x * 100}%`,
+          "--crop-right": `${(1 - visualActiveCrop.x - visualActiveCrop.width) * 100}%`,
+          "--crop-top": `${visualActiveCrop.y * 100}%`,
           "--straighten": `${straightenDegrees}deg`,
           "--straighten-scale": straightenScale,
           transform: `matrix(${zoom}, 0, 0, ${zoom}, ${pan.x}, ${pan.y})`,
@@ -3020,10 +3251,11 @@ function EditablePreviewImage({
           onRemoveTextBox={onRemoveTextBox}
           onResizeTextBoxStart={onResizeTextBoxStart}
           onTextChange={onTextChange}
+          rotation={page.rotation}
         />
       </div>
-      {tool !== "crop" && hasCommittedCrop ? <CommittedCropShadeLayer crop={committedCrop} /> : null}
-      {tool === "crop" ? <CropEditLayer crop={editingCrop} onCropHandleStart={onCropHandleStart} /> : null}
+      {tool !== "crop" && hasCommittedCrop ? <CommittedCropShadeLayer crop={visualCommittedCrop} /> : null}
+      {tool === "crop" ? <CropEditLayer crop={visualEditingCrop} onCropHandleStart={onCropHandleStart} /> : null}
     </div>
   );
 }
@@ -3038,6 +3270,7 @@ function PaintEditsLayer({
   onRemoveTextBox,
   onResizeTextBoxStart,
   onTextChange,
+  rotation,
 }: {
   activeTextEditId: string | null;
   draftCover: DraftCoverRect | null;
@@ -3052,21 +3285,20 @@ function PaintEditsLayer({
     handle: TextResizeHandle,
   ) => void;
   onTextChange: (edit: Extract<PdfPagePaintEdit, { type: "text" }>, text: string) => void;
+  rotation: number;
 }) {
   return (
     <div className="paint-edits-layer">
       {edits.map((edit) => {
         if (edit.type === "cover") {
+          const rect = rectToVisualRect(edit, rotation);
           return (
             <span
               className="paint-cover-edit"
               key={edit.id}
               style={{
                 background: edit.color,
-                height: `${edit.height * 100}%`,
-                left: `${edit.x * 100}%`,
-                top: `${edit.y * 100}%`,
-                width: `${edit.width * 100}%`,
+                ...rectStyle(rect),
               }}
             />
           );
@@ -3077,16 +3309,12 @@ function PaintEditsLayer({
         }
 
         if (edit.id === activeTextEditId) {
+          const rect = rectToVisualRect(edit, rotation);
           return (
             <div
               className="paint-text-box is-active"
               key={edit.id}
-              style={{
-                height: `${edit.height * 100}%`,
-                left: `${edit.x * 100}%`,
-                top: `${edit.y * 100}%`,
-                width: `${edit.width * 100}%`,
-              }}
+              style={rectStyle(rect)}
               onPointerDown={(event) => event.stopPropagation()}
             >
               <button className="paint-text-box-handle" type="button" aria-label="Move text box" onPointerDown={(event) => onMoveTextBoxStart(event, edit)}>
@@ -3144,6 +3372,7 @@ function PaintEditsLayer({
           );
         }
 
+        const rect = rectToVisualRect(edit, rotation);
         return (
           <span
             className="paint-text-edit"
@@ -3154,13 +3383,13 @@ function PaintEditsLayer({
               fontSize: `${edit.fontSize}px`,
               fontStyle: edit.italic ? "italic" : "normal",
               fontWeight: edit.bold ? 850 : 700,
-              height: `${edit.height * 100}%`,
-              left: `${edit.x * 100}%`,
+              height: `${rect.height * 100}%`,
+              left: `${rect.x * 100}%`,
               overflow: "hidden",
               textAlign: edit.textAlign,
               textDecoration: edit.underline ? "underline" : "none",
-              top: `${edit.y * 100}%`,
-              width: `${edit.width * 100}%`,
+              top: `${rect.y * 100}%`,
+              width: `${rect.width * 100}%`,
             }}
           >
             {edit.text}
@@ -3168,27 +3397,29 @@ function PaintEditsLayer({
         );
       })}
       {draftCover ? (
+        (() => {
+          const rect = rectToVisualRect(draftCover, rotation);
+          return (
         <span
           className="paint-cover-edit is-draft"
           style={{
             background: draftCoverColor,
-            height: `${draftCover.height * 100}%`,
-            left: `${draftCover.x * 100}%`,
-            top: `${draftCover.y * 100}%`,
-            width: `${draftCover.width * 100}%`,
+            ...rectStyle(rect),
           }}
         />
+          );
+        })()
       ) : null}
       {draftTextRect ? (
+        (() => {
+          const rect = rectToVisualRect(draftTextRect, rotation);
+          return (
         <span
           className="paint-text-box is-draft"
-          style={{
-            height: `${draftTextRect.height * 100}%`,
-            left: `${draftTextRect.x * 100}%`,
-            top: `${draftTextRect.y * 100}%`,
-            width: `${draftTextRect.width * 100}%`,
-          }}
+          style={rectStyle(rect)}
         />
+          );
+        })()
       ) : null}
     </div>
   );

@@ -15,17 +15,26 @@ import type {
 import { createDocumentFromMetadata } from "../utils/demoPages";
 
 export async function pickPdfFilePath(): Promise<string | null> {
+  const paths = await pickPdfFilePaths();
+  return paths[0] ?? null;
+}
+
+export async function pickPdfFilePaths(): Promise<string[]> {
   if (!isTauri()) {
-    return null;
+    return [];
   }
 
   const selected = await open({
-    multiple: false,
+    multiple: true,
     title: "Open PDF",
     filters: [{ name: "PDF", extensions: ["pdf"] }],
   });
 
-  return typeof selected === "string" ? selected : null;
+  if (typeof selected === "string") {
+    return [selected];
+  }
+
+  return Array.isArray(selected) ? selected : [];
 }
 
 export async function pickInsertFilePaths(): Promise<string[]> {
@@ -63,6 +72,19 @@ export async function pickSplitOutputFolderPath(): Promise<string | null> {
 export async function loadPdfDocumentFromPath(path: string): Promise<PdfDocument> {
   const metadata = await invoke<PdfMetadata>("read_pdf_metadata", { path });
   return createDocumentFromMetadata(metadata);
+}
+
+export async function readStartupPdfPath(): Promise<string | null> {
+  const paths = await readStartupPdfPaths();
+  return paths[0] ?? null;
+}
+
+export async function readStartupPdfPaths(): Promise<string[]> {
+  if (!isTauri()) {
+    return [];
+  }
+
+  return invoke<string[]>("read_startup_pdf_paths");
 }
 
 interface RenderPdfPagesOptions {
@@ -233,7 +255,11 @@ export async function openOutputFolder(path: string): Promise<void> {
 }
 
 export function findFirstPdfPath(paths: string[]): string | null {
-  return paths.find((path) => path.toLowerCase().endsWith(".pdf")) ?? null;
+  return findPdfPaths(paths)[0] ?? null;
+}
+
+export function findPdfPaths(paths: string[]): string[] {
+  return paths.filter((path) => path.toLowerCase().endsWith(".pdf"));
 }
 
 export function getFriendlyLoadError(error: unknown): string {

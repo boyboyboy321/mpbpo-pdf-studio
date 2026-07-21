@@ -46,6 +46,13 @@ interface DragState {
 
 type DropPosition = "after" | "before";
 
+interface PreviewRect {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
+}
+
 const MAX_PREVIEW_BATCH_SIZE = 1;
 const PREVIEW_ROW_OVERSCAN = 2;
 const SCROLL_IDLE_PREVIEW_COMMIT_DELAY = 260;
@@ -454,12 +461,7 @@ export const PageGrid = memo(function PageGrid({
       </div>
       <DragOverlay dropAnimation={null}>
         {activeDragPage ? (
-          <PageDragOverlay
-            movingCount={movingPageNumbers.size}
-            page={activeDragPage}
-            previewEntry={previewEntries[activeDragPage.id]}
-            thumbnailScale={document.thumbnailScale}
-          />
+          <PageDragOverlay movingCount={movingPageNumbers.size} />
         ) : null}
       </DragOverlay>
     </DndContext>
@@ -640,21 +642,11 @@ function PageDropZone({ pageNumber, position }: { pageNumber: number; position: 
   return <span ref={setNodeRef} className={`page-drop-zone is-${position}`} aria-hidden="true" />;
 }
 
-function PageDragOverlay({
-  movingCount,
-  page,
-  previewEntry,
-  thumbnailScale,
-}: {
-  movingCount: number;
-  page: PdfPage;
-  previewEntry: PreviewEntry | undefined;
-  thumbnailScale: number;
-}) {
+function PageDragOverlay({ movingCount }: { movingCount: number }) {
   return (
-    <div className="page-drag-overlay" style={{ "--scale": thumbnailScale } as CSSProperties}>
-      <PagePreview page={page} previewEntry={previewEntry} />
-      <span>{movingCount > 1 ? `${movingCount} pages` : `Page ${page.pageNumber}`}</span>
+    <div className="page-drag-overlay">
+      <strong>Move here</strong>
+      <span>{movingCount > 1 ? `${movingCount} pages` : "1 page"}</span>
     </div>
   );
 }
@@ -686,6 +678,7 @@ function PagePreview({ page, previewEntry }: { page: PdfPage; previewEntry: Prev
 function PreviewImage({ page, preview }: { page: PdfPage; preview: PdfPagePreview }) {
   const isSideways = page.rotation === 90 || page.rotation === 270;
   const crop = getActiveThumbnailCrop(page);
+  const visualCrop = rectToVisualRect(crop, page.rotation);
   const straightenDegrees = getThumbnailStraightenDegrees(page);
   const straightenScale = getThumbnailStraightenScale(straightenDegrees);
 
@@ -694,10 +687,10 @@ function PreviewImage({ page, preview }: { page: PdfPage; preview: PdfPagePrevie
       className={`page-preview-paper ${isSideways ? "is-sideways" : ""} ${page.deleted ? "is-deleted" : ""} ${page.tinted ? "is-tinted" : ""}`}
       style={
         {
-          "--crop-bottom": `${(1 - crop.y - crop.height) * 100}%`,
-          "--crop-left": `${crop.x * 100}%`,
-          "--crop-right": `${(1 - crop.x - crop.width) * 100}%`,
-          "--crop-top": `${crop.y * 100}%`,
+          "--crop-bottom": `${(1 - visualCrop.y - visualCrop.height) * 100}%`,
+          "--crop-left": `${visualCrop.x * 100}%`,
+          "--crop-right": `${(1 - visualCrop.x - visualCrop.width) * 100}%`,
+          "--crop-top": `${visualCrop.y * 100}%`,
           "--page-ratio": `${preview.width} / ${preview.height}`,
           "--rotation": `${page.rotation}deg`,
           "--straighten": `${straightenDegrees}deg`,
@@ -718,16 +711,14 @@ function ThumbnailPaintLayer({ page }: { page: PdfPage }) {
     <div className="page-preview-paint-layer" aria-hidden="true">
       {page.paintEdits.map((edit) => {
         if (edit.type === "cover") {
+          const rect = rectToVisualRect(edit, page.rotation);
           return (
             <span
               className="page-preview-cover-edit"
               key={edit.id}
               style={{
                 background: edit.color,
-                height: `${edit.height * 100}%`,
-                left: `${edit.x * 100}%`,
-                top: `${edit.y * 100}%`,
-                width: `${edit.width * 100}%`,
+                ...rectStyle(rect),
               }}
             />
           );
@@ -737,6 +728,7 @@ function ThumbnailPaintLayer({ page }: { page: PdfPage }) {
           return null;
         }
 
+        const rect = rectToVisualRect(edit, page.rotation);
         return (
           <span
             className="page-preview-text-edit"
@@ -747,12 +739,12 @@ function ThumbnailPaintLayer({ page }: { page: PdfPage }) {
               fontSize: `${Math.max(4, edit.fontSize * 0.24)}px`,
               fontWeight: edit.bold ? 800 : 700,
               fontStyle: edit.italic ? "italic" : "normal",
-              height: `${edit.height * 100}%`,
-              left: `${edit.x * 100}%`,
+              height: `${rect.height * 100}%`,
+              left: `${rect.x * 100}%`,
               textAlign: edit.textAlign,
               textDecoration: edit.underline ? "underline" : "none",
-              top: `${edit.y * 100}%`,
-              width: `${edit.width * 100}%`,
+              top: `${rect.y * 100}%`,
+              width: `${rect.width * 100}%`,
             }}
           >
             {edit.text}
@@ -761,6 +753,53 @@ function ThumbnailPaintLayer({ page }: { page: PdfPage }) {
       })}
     </div>
   );
+}
+
+function normalizedRect(start: { x: number; y: number }, end: { x: number; y: number }): PreviewRect {
+  return {
+    height: Math.abs(end.y - start.y),
+    width: Math.abs(end.x - start.x),
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+  };
+}
+
+function normalizePageRotation(rotation: number): 0 | 90 | 180 | 270 {
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+
+  if (normalizedRotation === 90 || normalizedRotation === 180 || normalizedRotation === 270) {
+    return normalizedRotation;
+  }
+
+  return 0;
+}
+
+function pagePointToVisualPoint(point: { x: number; y: number }, rotation: number): { x: number; y: number } {
+  switch (normalizePageRotation(rotation)) {
+    case 90:
+      return { x: 1 - point.y, y: point.x };
+    case 180:
+      return { x: 1 - point.x, y: 1 - point.y };
+    case 270:
+      return { x: point.y, y: 1 - point.x };
+    default:
+      return point;
+  }
+}
+
+function rectToVisualRect(rect: PreviewRect, rotation: number): PreviewRect {
+  const start = pagePointToVisualPoint({ x: rect.x, y: rect.y }, rotation);
+  const end = pagePointToVisualPoint({ x: rect.x + rect.width, y: rect.y + rect.height }, rotation);
+  return normalizedRect(start, end);
+}
+
+function rectStyle(rect: PreviewRect): CSSProperties {
+  return {
+    height: `${rect.height * 100}%`,
+    left: `${rect.x * 100}%`,
+    top: `${rect.y * 100}%`,
+    width: `${rect.width * 100}%`,
+  };
 }
 
 function draggablePageId(pageId: string): string {

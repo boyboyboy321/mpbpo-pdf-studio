@@ -1,4 +1,4 @@
-import { FileImage, FilePenLine, Files, Folder, Home, Plus, Search, Upload } from "lucide-react";
+import { FileImage, FilePenLine, Files, Folder, Plus, Search, Upload } from "lucide-react";
 import { useState } from "react";
 
 import type { PdfLoadState, RecentFile, ToolItem } from "../domain/pdf";
@@ -26,16 +26,6 @@ export function HomeView({ isFileDragging, loadState, recentFiles, onOpenDemo, o
 
   return (
     <main className="home-shell">
-      <div className="home-tabs">
-        <button className="tab-button is-active" type="button">
-          <Home size={19} />
-          Home
-        </button>
-        <button className="tab-add" type="button" onClick={onPickPdf} aria-label="Open another PDF">
-          <Plus size={18} />
-        </button>
-      </div>
-
       <div className="home-layout">
         <aside className="home-sidebar">
           <button className="primary-open" type="button" onClick={onPickPdf}>

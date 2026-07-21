@@ -77,7 +77,7 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 38px minmax(0, 1fr);
+  grid-template-rows: 38px 40px minmax(0, 1fr);
   overflow: hidden;
   background: var(--canvas);
 }
@@ -205,8 +205,96 @@ button:disabled {
 
 .home-shell {
   display: grid;
-  grid-template-rows: 52px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
+}
+
+.document-tabbar {
+  min-width: 0;
+  height: 40px;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 5px 10px 0;
+  overflow: hidden;
+  background: #f5f5f6;
+  border-bottom: 1px solid #dedfe4;
+}
+
+.document-tab,
+.document-tab-add {
+  height: 35px;
+  border: 1px solid transparent;
+  background: transparent;
+}
+
+.document-tab {
+  max-width: 235px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 5px 0 10px;
+  border-radius: 7px 7px 0 0;
+  color: #596273;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.document-tab span:not(.document-tab-close) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-tab.is-home {
+  flex: 0 0 auto;
+  color: #1f232a;
+}
+
+.document-tab.is-active {
+  color: var(--blue);
+  background: var(--surface);
+  border-color: #dcdfe5;
+  border-bottom-color: var(--surface);
+}
+
+.document-tab.is-dirty span:not(.document-tab-close) {
+  font-weight: 800;
+}
+
+.document-tab-close {
+  width: 23px;
+  height: 23px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  color: #747d8e;
+}
+
+.document-tab-close:hover {
+  color: #20242c;
+  background: rgba(31, 35, 42, 0.08);
+}
+
+.document-tab-add {
+  width: 36px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  color: #1f232a;
+}
+
+.document-tab-add:hover,
+.document-tab:hover {
+  background: rgba(31, 35, 42, 0.06);
+}
+
+.document-tab.is-active:hover {
+  background: var(--surface);
 }
 
 .home-tabs {
@@ -556,12 +644,13 @@ button:disabled {
   display: grid;
   height: 100%;
   min-height: 0;
-  grid-template-rows: 62px minmax(0, 1fr);
+  grid-template-rows: 44px minmax(0, 1fr);
   overflow: hidden;
 }
 
 .editor-topbar {
-  gap: 14px;
+  justify-content: flex-end;
+  gap: 12px;
   padding: 0 18px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
@@ -573,6 +662,13 @@ button:disabled {
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
+}
+
+.document-title.is-compact {
+  flex: 1;
+  justify-content: flex-end;
+  align-items: center;
+  min-width: 160px;
 }
 
 .document-title strong {
@@ -659,7 +755,7 @@ button:disabled {
   min-height: 0;
   position: relative;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   background: #fafafa;
 }
 
@@ -709,6 +805,17 @@ button:disabled {
   font-weight: 700;
 }
 
+.scale-control.is-panel {
+  flex: 1;
+  justify-content: flex-start;
+  min-width: 0;
+  gap: 8px;
+}
+
+.scale-control.is-panel input {
+  width: min(116px, 100%);
+}
+
 .scale-control input {
   accent-color: var(--blue);
 }
@@ -716,7 +823,7 @@ button:disabled {
 .page-grid-scroll {
   min-height: 0;
   overflow: auto;
-  padding: 26px 28px 38px;
+  padding: 18px 28px 34px;
   contain: strict;
   overscroll-behavior: contain;
 }
@@ -817,27 +924,30 @@ button:disabled {
 
 .page-drag-overlay {
   display: grid;
-  justify-items: center;
-  gap: 7px;
-  color: var(--text);
+  gap: 2px;
+  border-radius: 6px;
+  padding: 8px 11px;
+  color: #ffffff;
+  background: rgba(20, 22, 26, 0.92);
+  box-shadow: 0 14px 32px rgba(20, 22, 26, 0.24);
   pointer-events: none;
-  transform: rotate(1deg);
+  transform: translate(10px, 12px);
 }
 
-.page-drag-overlay .mock-paper,
-.page-drag-overlay .page-preview-paper {
-  box-shadow:
-    0 0 0 3px rgba(11, 87, 255, 0.16),
-    0 22px 46px rgba(21, 31, 54, 0.26);
+.page-drag-overlay strong,
+.page-drag-overlay span {
+  font-weight: 850;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.page-drag-overlay strong {
+  font-size: 13px;
 }
 
 .page-drag-overlay span {
-  border-radius: 999px;
-  padding: 5px 10px;
-  color: #ffffff;
-  background: rgba(20, 22, 26, 0.9);
-  font-size: 12px;
-  font-weight: 850;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
 }
 
 .page-select-button {
@@ -1198,8 +1308,9 @@ button:disabled {
 
 .detail-panel-header {
   display: flex;
+  align-items: center;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: space-between;
 }
 
 .render-settings-panel {
@@ -2331,7 +2442,8 @@ button:disabled {
 
 .paint-cover-edit {
   position: absolute;
-  opacity: 0.98;
+  opacity: 1;
+  mix-blend-mode: normal;
 }
 
 .paint-cover-edit.is-draft {

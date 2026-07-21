@@ -10,7 +10,7 @@ export type AppPolicy = {
   version?: string;
 };
 
-export const APP_VERSION = "0.2.0";
+export const APP_VERSION = "0.2.2";
 
 const APP_POLICY_URL = "https://github.com/boyboyboy321/mpbpo-pdf-studio/releases/latest/download/app-policy.json";
 
@@ -44,7 +44,14 @@ export function compareVersions(leftVersion: string, rightVersion: string) {
 }
 
 export async function loadAppPolicy() {
-  const response = await fetch(APP_POLICY_URL, { cache: "no-store" });
+  const policyUrl = `${APP_POLICY_URL}?v=${encodeURIComponent(APP_VERSION)}&t=${Date.now()}`;
+  const response = await fetch(policyUrl, {
+    cache: "no-store",
+    headers: {
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+    },
+  });
 
   if (!response.ok) {
     throw new Error(`Could not load app policy (${response.status}).`);
@@ -59,15 +66,15 @@ export function getPolicyBlockMessage(policy: AppPolicy | null, currentVersion: 
   }
 
   if (policy.blocked) {
-    return policy.blockedMessage || policy.message || "This version has been locked by the publisher.";
+    return policy.blockedMessage || "MpBPO PDF Studio đang tạm dừng truy cập.";
   }
 
   if (policy.blockedVersions?.includes(currentVersion)) {
-    return policy.blockedMessage || "This version has been locked by the publisher.";
+    return policy.blockedMessage || "Phiên bản này cần được cập nhật trước khi sử dụng.";
   }
 
   if (policy.minVersion && compareVersions(currentVersion, policy.minVersion) < 0) {
-    return policy.blockedMessage || `Version ${policy.minVersion} or newer is required.`;
+    return policy.blockedMessage || `Vui lòng cập nhật lên phiên bản ${policy.minVersion} hoặc mới hơn.`;
   }
 
   return null;
