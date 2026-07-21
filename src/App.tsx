@@ -47,7 +47,7 @@ type AppUpdateState =
 type AppAccessState =
   | { status: "checking" }
   | { status: "ready" }
-  | { status: "locked"; message: string; title: string };
+  | { status: "locked"; message: string; reason: "connection" | "policy"; title: string };
 
 type FileWriteJobKind = "save" | "split";
 
@@ -142,6 +142,7 @@ export function App() {
           setAppAccessState({
             status: "locked",
             message: blockMessage,
+            reason: "policy",
             title: "Không thể mở ứng dụng",
           });
         } else if (isActive) {
@@ -152,6 +153,7 @@ export function App() {
         if (isActive) {
           setAppAccessState({
             status: "locked",
+            reason: "connection",
             message: "Không thể kiểm tra cập nhật. Vui lòng kiểm tra kết nối mạng rồi mở lại.",
             title: "Lỗi kết nối",
           });
@@ -976,12 +978,14 @@ function AppAccessGate({
   let action: ReactNode = null;
   let progress: ReactNode = null;
 
+  const policyLocked = accessState.status === "locked" && accessState.reason === "policy";
+
   if (accessState.status === "locked") {
     title = accessState.title;
     message = accessState.message;
   }
 
-  if (accessState.status !== "locked" && updateState.status === "available" && updateState.mandatory) {
+  if (!policyLocked && updateState.status === "available" && updateState.mandatory) {
     title = "Required update";
     message = `Version ${updateState.version} is ready. Update is required before using the app.`;
     action = (
@@ -991,11 +995,11 @@ function AppAccessGate({
     );
   }
 
-  if (accessState.status !== "locked" && updateState.status === "available" && updateState.errorMessage) {
+  if (!policyLocked && updateState.status === "available" && updateState.errorMessage) {
     message = updateState.errorMessage;
   }
 
-  if (accessState.status !== "locked" && updateState.status === "downloading") {
+  if (!policyLocked && updateState.status === "downloading") {
     title = "Updating MpBPO PDF Studio";
     message = updateState.totalBytes ? `Downloading version ${updateState.version} (${updateState.percent}%).` : `Downloading version ${updateState.version}.`;
     progress = (
@@ -1005,7 +1009,7 @@ function AppAccessGate({
     );
   }
 
-  if (accessState.status !== "locked" && updateState.status === "installing") {
+  if (!policyLocked && updateState.status === "installing") {
     title = "Installing update";
     message = "The app will restart automatically when the update is ready.";
     progress = (
@@ -1015,7 +1019,7 @@ function AppAccessGate({
     );
   }
 
-  if (accessState.status !== "locked" && updateState.status === "error" && updateState.mandatory) {
+  if (!policyLocked && updateState.status === "error" && updateState.mandatory) {
     title = "Update failed";
     message = updateState.message;
   }
@@ -1237,3 +1241,4 @@ function AppTitleBar({ forceClose = false, onRequestClose }: { forceClose?: bool
     </header>
   );
 }
+

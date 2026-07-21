@@ -98,7 +98,7 @@ const appPolicy = {
   schemaVersion: 1,
   appId: "mpbpo-pdf-studio",
   version,
-  minVersion: version,
+  minVersion: "0.0.0",
   mandatoryUpdate: true,
   blocked: false,
   blockedVersions: [],
