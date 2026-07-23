@@ -27,11 +27,12 @@ const THUMBNAIL_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const THUMBNAIL_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const THUMBNAIL_CACHE_ROOT_NAME: &str = "SplitPDFStudio";
 const THUMBNAIL_CACHE_DIR_NAME: &str = "thumbnail-cache";
+const PDF_RENDER_SESSION_IDLE_TTL: Duration = Duration::from_secs(4);
 const DETAIL_JPEG_PREVIEW_QUALITY: u8 = 76;
 const SMALL_JPEG_PREVIEW_QUALITY: u8 = 66;
 const PREVIEW_TARGET_WIDTH_MIN: i32 = 72;
-const PREVIEW_TARGET_WIDTH_MAX: i32 = 2200;
-const PREVIEW_TARGET_HEIGHT_MAX: i32 = 4200;
+const PREVIEW_TARGET_WIDTH_MAX: i32 = 4200;
+const PREVIEW_TARGET_HEIGHT_MAX: i32 = 8400;
 const OPEN_PDF_PATHS_EVENT: &str = "open-pdf-paths";
 const SPLIT_PROGRESS_EVENT: &str = "split-progress";
 const APP_POLICY_URLS: [&str; 2] = [
@@ -51,6 +52,27 @@ const PAGE_INHERITABLE_KEYS: [&[u8]; 8] = [
 
 static PDFIUM_BIND_LOCK: Mutex<()> = Mutex::new(());
 static PDFIUM_RENDER_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn SetProcessWorkingSetSize(
+        process: isize,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn trim_process_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trim_process_working_set() {}
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -323,7 +345,12 @@ struct AppStateInner {
 }
 
 struct PdfRenderWorker {
-    sender: Mutex<mpsc::Sender<RenderJob>>,
+    sender: Mutex<mpsc::Sender<RenderCommand>>,
+}
+
+enum RenderCommand {
+    Render(RenderJob),
+    Release { response: mpsc::Sender<()> },
 }
 
 struct RenderJob {
@@ -411,13 +438,26 @@ impl PdfRenderWorker {
         self.sender
             .lock()
             .map_err(|_| AppError::State("PDF render worker lock was poisoned".to_string()))?
-            .send(job)
+            .send(RenderCommand::Render(job))
             .map_err(|_| AppError::State("PDF render worker stopped".to_string()))?;
 
         result
             .recv()
             .map_err(|_| AppError::State("PDF render worker did not return a result".to_string()))?
             .map_err(AppError::Preview)
+    }
+
+    fn release_session(&self) -> Result<(), AppError> {
+        let (response, result) = mpsc::channel();
+        self.sender
+            .lock()
+            .map_err(|_| AppError::State("PDF render worker lock was poisoned".to_string()))?
+            .send(RenderCommand::Release { response })
+            .map_err(|_| AppError::State("PDF render worker stopped".to_string()))?;
+
+        result.recv().map_err(|_| {
+            AppError::State("PDF render worker did not release the current PDF".to_string())
+        })
     }
 }
 
@@ -430,6 +470,10 @@ impl AppState {
             job.maximum_height,
             job.jpeg_quality,
         )
+    }
+
+    fn release_render_session(&self) -> Result<(), AppError> {
+        self.inner.renderer.release_session()
     }
 
     fn cleanup_thumbnail_cache_if_due(&self) -> Result<(), AppError> {
@@ -614,23 +658,28 @@ fn sample_image_color_impl(
 
 #[tauri::command]
 async fn split_pdf(
+    state: State<'_, AppState>,
     app: tauri::AppHandle,
     path: String,
     cut_before_pages: Vec<u32>,
     output_options: Option<SplitOutputOptions>,
     run_id: String,
 ) -> Result<SplitResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    state.release_render_session()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         split_pdf_impl(path, cut_before_pages, run_id, output_options, |progress| {
             let _ = app.emit(SPLIT_PROGRESS_EVENT, progress);
         })
     })
     .await
-    .map_err(|error| AppError::State(format!("PDF split task failed: {error}")))?
+    .map_err(|error| AppError::State(format!("PDF split task failed: {error}")))?;
+    trim_process_working_set();
+    result
 }
 
 #[tauri::command]
 async fn split_pdf_with_edits(
+    state: State<'_, AppState>,
     app: tauri::AppHandle,
     path: String,
     pages: Vec<EditPagePlan>,
@@ -638,7 +687,8 @@ async fn split_pdf_with_edits(
     output_options: Option<SplitOutputOptions>,
     run_id: String,
 ) -> Result<SplitResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    state.release_render_session()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         split_pdf_with_edits_impl(
             path,
             pages,
@@ -651,7 +701,9 @@ async fn split_pdf_with_edits(
         )
     })
     .await
-    .map_err(|error| AppError::State(format!("PDF split task failed: {error}")))?
+    .map_err(|error| AppError::State(format!("PDF split task failed: {error}")))?;
+    trim_process_working_set();
+    result
 }
 
 #[tauri::command]
@@ -973,10 +1025,17 @@ fn read_insert_pages_impl(paths: Vec<String>) -> Result<Vec<InsertPageMetadata>,
 }
 
 #[tauri::command]
-async fn save_pdf_edits(path: String, pages: Vec<EditPagePlan>) -> Result<PdfMetadata, AppError> {
-    tauri::async_runtime::spawn_blocking(move || save_pdf_edits_impl(path, pages))
+async fn save_pdf_edits(
+    state: State<'_, AppState>,
+    path: String,
+    pages: Vec<EditPagePlan>,
+) -> Result<PdfMetadata, AppError> {
+    state.release_render_session()?;
+    let result = tauri::async_runtime::spawn_blocking(move || save_pdf_edits_impl(path, pages))
         .await
-        .map_err(|error| AppError::State(format!("PDF save task failed: {error}")))?
+        .map_err(|error| AppError::State(format!("PDF save task failed: {error}")))?;
+    trim_process_working_set();
+    result
 }
 
 #[tauri::command]
@@ -1084,19 +1143,20 @@ fn render_pdf_pages_impl(
         .collect())
 }
 
-fn render_worker_loop(receiver: mpsc::Receiver<RenderJob>) {
-    let first_job = match receiver.recv() {
-        Ok(job) => job,
-        Err(_) => return,
-    };
-
+fn render_worker_loop(receiver: mpsc::Receiver<RenderCommand>) {
     let pdfium = match bind_pdfium_for_worker() {
         Ok(pdfium) => pdfium,
         Err(error) => {
             let message = format!("Could not prepare PDF renderer: {error}");
-            let _ = first_job.response.send(Err(message.clone()));
-            for job in receiver {
-                let _ = job.response.send(Err(message.clone()));
+            for command in receiver {
+                match command {
+                    RenderCommand::Render(job) => {
+                        let _ = job.response.send(Err(message.clone()));
+                    }
+                    RenderCommand::Release { response } => {
+                        let _ = response.send(());
+                    }
+                }
             }
             return;
         }
@@ -1104,10 +1164,24 @@ fn render_worker_loop(receiver: mpsc::Receiver<RenderJob>) {
 
     let mut current_session: Option<WorkerPdfSession<'_>> = None;
 
-    respond_to_render_job(&pdfium, &mut current_session, first_job);
-
-    for job in receiver {
-        respond_to_render_job(&pdfium, &mut current_session, job);
+    loop {
+        match receiver.recv_timeout(PDF_RENDER_SESSION_IDLE_TTL) {
+            Ok(RenderCommand::Render(job)) => {
+                respond_to_render_job(&pdfium, &mut current_session, job);
+            }
+            Ok(RenderCommand::Release { response }) => {
+                if current_session.take().is_some() {
+                    trim_process_working_set();
+                }
+                let _ = response.send(());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if current_session.take().is_some() {
+                    trim_process_working_set();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
 }
 
@@ -1306,7 +1380,7 @@ fn preview_jpeg_quality(lane: RenderLane) -> u8 {
 }
 
 fn clamp_jpeg_quality(jpeg_quality: u8) -> u8 {
-    jpeg_quality.clamp(45, 92)
+    jpeg_quality.clamp(45, 96)
 }
 
 fn thumbnail_cache_file(
@@ -1906,6 +1980,7 @@ fn append_pdf_page(
 
     if let Object::Dictionary(page_dictionary) = &mut page_object {
         page_dictionary.set("Parent", pages_id);
+        normalize_page_contents(output_document, page_dictionary)?;
         let source_rotation = page_rotation(page_dictionary);
         apply_page_rotation(page_dictionary, rotation);
         append_paint_edits_to_page(
@@ -2080,8 +2155,8 @@ fn apply_page_straighten(
     end_stream.compress()?;
     let end_id = output_document.add_object(end_stream);
 
-    prepend_page_content(page_dictionary, begin_id);
-    append_page_content(page_dictionary, end_id);
+    prepend_page_content(output_document, page_dictionary, begin_id)?;
+    append_page_content(output_document, page_dictionary, end_id)?;
     Ok(())
 }
 
@@ -2189,7 +2264,7 @@ fn append_paint_edits_to_page(
     let mut content_stream = Stream::new(dictionary! {}, content.into_bytes());
     content_stream.compress()?;
     let content_id = output_document.add_object(content_stream);
-    append_page_content(page_dictionary, content_id);
+    append_page_content(output_document, page_dictionary, content_id)?;
     Ok(())
 }
 
@@ -2356,41 +2431,140 @@ fn paint_edits_content(
     content
 }
 
-fn append_page_content(page_dictionary: &mut Dictionary, content_id: ObjectId) {
+fn append_page_content(
+    document: &mut LopdfDocument,
+    page_dictionary: &mut Dictionary,
+    content_id: ObjectId,
+) -> Result<(), AppError> {
     let content_ref = Object::Reference(content_id);
+    let mut contents = flattened_page_contents(document, page_dictionary)?;
+    contents.push(content_ref);
+    set_page_contents(page_dictionary, contents);
+    Ok(())
+}
+
+fn prepend_page_content(
+    document: &mut LopdfDocument,
+    page_dictionary: &mut Dictionary,
+    content_id: ObjectId,
+) -> Result<(), AppError> {
+    let content_ref = Object::Reference(content_id);
+    let mut contents = flattened_page_contents(document, page_dictionary)?;
+    contents.insert(0, content_ref);
+    set_page_contents(page_dictionary, contents);
+    Ok(())
+}
+
+fn normalize_page_contents(
+    document: &mut LopdfDocument,
+    page_dictionary: &mut Dictionary,
+) -> Result<(), AppError> {
+    let contents = flattened_page_contents(document, page_dictionary)?;
+    set_page_contents(page_dictionary, contents);
+    Ok(())
+}
+
+fn flattened_page_contents(
+    document: &mut LopdfDocument,
+    page_dictionary: &mut Dictionary,
+) -> Result<Vec<Object>, AppError> {
     match page_dictionary.remove(b"Contents") {
-        Some(Object::Array(mut contents)) => {
-            contents.push(content_ref);
+        Some(contents) => {
+            let mut content_refs = Vec::new();
+            let mut content_stack = HashSet::new();
+            collect_content_stream_refs(document, contents, &mut content_refs, &mut content_stack)?;
+            Ok(content_refs)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn collect_content_stream_refs(
+    document: &mut LopdfDocument,
+    content: Object,
+    content_refs: &mut Vec<Object>,
+    content_stack: &mut HashSet<ObjectId>,
+) -> Result<(), AppError> {
+    match content {
+        Object::Reference(content_id) => {
+            let referenced = document.objects.get(&content_id).cloned().ok_or_else(|| {
+                AppError::SplitValidation(format!(
+                    "Contents object {} {} was not found",
+                    content_id.0, content_id.1
+                ))
+            })?;
+            match referenced {
+                Object::Array(values) => {
+                    if !content_stack.insert(content_id) {
+                        return Err(AppError::SplitValidation(format!(
+                            "Contents array {} {} contains a cycle",
+                            content_id.0, content_id.1
+                        )));
+                    }
+                    for value in values {
+                        collect_content_stream_refs(document, value, content_refs, content_stack)?;
+                    }
+                    content_stack.remove(&content_id);
+                }
+                Object::Stream(_) => content_refs.push(Object::Reference(content_id)),
+                Object::Null => {}
+                other => {
+                    return Err(AppError::SplitValidation(format!(
+                        "Contents object {} {} is {}, expected a stream or an array",
+                        content_id.0,
+                        content_id.1,
+                        pdf_object_kind(&other)
+                    )));
+                }
+            }
+        }
+        Object::Array(values) => {
+            for value in values {
+                collect_content_stream_refs(document, value, content_refs, content_stack)?;
+            }
+        }
+        Object::Stream(stream) => {
+            let content_id = document.add_object(stream);
+            content_refs.push(Object::Reference(content_id));
+        }
+        Object::Null => {}
+        other => {
+            return Err(AppError::SplitValidation(format!(
+                "Page Contents is {}, expected a stream or an array",
+                pdf_object_kind(&other)
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn set_page_contents(page_dictionary: &mut Dictionary, mut contents: Vec<Object>) {
+    match contents.len() {
+        0 => {
+            page_dictionary.remove(b"Contents");
+        }
+        1 => {
+            page_dictionary.set("Contents", contents.remove(0));
+        }
+        _ => {
             page_dictionary.set("Contents", Object::Array(contents));
-        }
-        Some(existing_content) => {
-            page_dictionary.set(
-                "Contents",
-                Object::Array(vec![existing_content, content_ref]),
-            );
-        }
-        None => {
-            page_dictionary.set("Contents", content_ref);
         }
     }
 }
 
-fn prepend_page_content(page_dictionary: &mut Dictionary, content_id: ObjectId) {
-    let content_ref = Object::Reference(content_id);
-    match page_dictionary.remove(b"Contents") {
-        Some(Object::Array(mut contents)) => {
-            contents.insert(0, content_ref);
-            page_dictionary.set("Contents", Object::Array(contents));
-        }
-        Some(existing_content) => {
-            page_dictionary.set(
-                "Contents",
-                Object::Array(vec![content_ref, existing_content]),
-            );
-        }
-        None => {
-            page_dictionary.set("Contents", content_ref);
-        }
+fn pdf_object_kind(object: &Object) -> &'static str {
+    match object {
+        Object::Null => "null",
+        Object::Boolean(_) => "boolean",
+        Object::Integer(_) => "integer",
+        Object::Real(_) => "real",
+        Object::Name(_) => "name",
+        Object::String(_, _) => "string",
+        Object::Array(_) => "array",
+        Object::Dictionary(_) => "dictionary",
+        Object::Stream(_) => "stream",
+        Object::Reference(_) => "reference",
     }
 }
 
@@ -3671,6 +3845,77 @@ mod tests {
     }
 
     #[test]
+    fn page_content_append_and_prepend_flatten_nested_content_arrays() {
+        let mut document = LopdfDocument::with_version("1.5");
+        let first_content_id = document.add_object(Stream::new(dictionary! {}, b"q\nQ\n".to_vec()));
+        let second_content_id =
+            document.add_object(Stream::new(dictionary! {}, b"BT\nET\n".to_vec()));
+        let nested_array_id =
+            document.add_object(Object::Array(vec![Object::Reference(first_content_id)]));
+        let mut page_dictionary = dictionary! {
+            "Contents" => Object::Array(vec![
+                Object::Reference(nested_array_id),
+                Object::Array(vec![Object::Reference(second_content_id)]),
+            ]),
+        };
+        let prepended_content_id =
+            document.add_object(Stream::new(dictionary! {}, b"prepended\n".to_vec()));
+        let appended_content_id =
+            document.add_object(Stream::new(dictionary! {}, b"appended\n".to_vec()));
+
+        prepend_page_content(&mut document, &mut page_dictionary, prepended_content_id)
+            .expect("prepend content");
+        append_page_content(&mut document, &mut page_dictionary, appended_content_id)
+            .expect("append content");
+
+        assert_flat_page_contents(
+            &document,
+            page_dictionary
+                .get(b"Contents")
+                .expect("flattened page contents"),
+            &[
+                prepended_content_id,
+                first_content_id,
+                second_content_id,
+                appended_content_id,
+            ],
+        );
+    }
+
+    #[test]
+    fn split_normalizes_indirect_content_array_without_reencoding_images() {
+        let work_dir =
+            std::env::temp_dir().join(format!("splitpdf-content-normalize-{}", std::process::id()));
+        fs::create_dir_all(&work_dir).expect("create content normalize dir");
+        let source_path = work_dir.join("IndirectContents.pdf");
+        let output_path = work_dir.join("IndirectContents_001.pdf");
+        create_pdf_with_indirect_content_array(&source_path);
+        let source_document = LopdfDocument::load(&source_path).expect("load source pdf");
+
+        write_page_range(
+            &source_document,
+            &output_path,
+            PageRange { start: 1, end: 1 },
+        )
+        .expect("write normalized split page");
+
+        let output_document = LopdfDocument::load(&output_path).expect("load split output");
+        let output_page_id = *output_document.get_pages().get(&1).expect("output page id");
+        let output_page = output_document
+            .get_dictionary(output_page_id)
+            .expect("output page dictionary");
+        assert_flat_page_contents(
+            &output_document,
+            output_page.get(b"Contents").expect("output contents"),
+            &[],
+        );
+        let image_filters = page_image_filters(&output_document, output_page);
+        assert_eq!(image_filters, vec!["/DCTDecode".to_string()]);
+
+        let _ = fs::remove_dir_all(&work_dir);
+    }
+
+    #[test]
     fn split_pdf_writes_outputs_to_timestamped_sibling_folder() {
         let work_dir =
             std::env::temp_dir().join(format!("splitpdf-split-output-{}", std::process::id()));
@@ -3827,6 +4072,54 @@ mod tests {
         create_smoke_pdf_with_page_count(path, 1);
     }
 
+    fn create_pdf_with_indirect_content_array(path: &Path) {
+        let mut document = LopdfDocument::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        ));
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            b"q\n1 0 0 1 0 0 cm\n/Im0 Do\nQ\n".to_vec(),
+        ));
+        let content_array_id =
+            document.add_object(Object::Array(vec![Object::Reference(content_id)]));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Im0" => image_id,
+                },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+            "Contents" => content_array_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document.save(path).expect("save indirect content pdf");
+    }
+
     fn create_smoke_pdf_with_page_count(path: &Path, page_count: u32) {
         let mut document = LopdfDocument::with_version("1.5");
         let pages_id = document.new_object_id();
@@ -3884,5 +4177,89 @@ mod tests {
         document.trailer.set("Root", catalog_id);
         document.compress();
         document.save(path).expect("save smoke pdf");
+    }
+
+    fn assert_flat_page_contents(
+        document: &LopdfDocument,
+        contents: &Object,
+        expected_ids: &[ObjectId],
+    ) {
+        let content_ids = flat_content_ids(document, contents);
+        if !expected_ids.is_empty() {
+            assert_eq!(content_ids, expected_ids);
+        }
+
+        for content_id in content_ids {
+            assert!(matches!(
+                document.objects.get(&content_id),
+                Some(Object::Stream(_))
+            ));
+        }
+    }
+
+    fn flat_content_ids(document: &LopdfDocument, contents: &Object) -> Vec<ObjectId> {
+        match contents {
+            Object::Reference(id) => match document.objects.get(id) {
+                Some(Object::Stream(_)) => vec![*id],
+                Some(Object::Array(_)) => panic!("page contents reference an array"),
+                other => panic!("page contents reference unexpected object: {other:?}"),
+            },
+            Object::Array(values) => values
+                .iter()
+                .flat_map(|value| match value {
+                    Object::Reference(id) => match document.objects.get(id) {
+                        Some(Object::Stream(_)) => vec![*id],
+                        Some(Object::Array(_)) => panic!("nested content array was not flattened"),
+                        other => panic!("content array references unexpected object: {other:?}"),
+                    },
+                    Object::Array(_) => panic!("direct nested content array was not flattened"),
+                    other => panic!("content array contains unexpected object: {other:?}"),
+                })
+                .collect(),
+            other => panic!("page contents were not normalized: {other:?}"),
+        }
+    }
+
+    fn page_image_filters(document: &LopdfDocument, page_dictionary: &Dictionary) -> Vec<String> {
+        let mut filters = Vec::new();
+        let Ok(resources) = page_dictionary.get(b"Resources") else {
+            return filters;
+        };
+        let Ok(resources) = resources.as_dict() else {
+            return filters;
+        };
+        let Ok(xobjects) = resources.get(b"XObject") else {
+            return filters;
+        };
+        let Ok(xobjects) = xobjects.as_dict() else {
+            return filters;
+        };
+
+        for (_, object) in xobjects {
+            let Ok(object_id) = object.as_reference() else {
+                continue;
+            };
+            let Some(Object::Stream(stream)) = document.objects.get(&object_id) else {
+                continue;
+            };
+            if stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|value| value.as_name().ok())
+                == Some(b"Image".as_slice())
+            {
+                let filter = stream
+                    .dict
+                    .get(b"Filter")
+                    .ok()
+                    .and_then(|value| value.as_name().ok())
+                    .map(|name| format!("/{}", String::from_utf8_lossy(name)))
+                    .unwrap_or_else(|| "None".to_string());
+                filters.push(filter);
+            }
+        }
+
+        filters
     }
 }

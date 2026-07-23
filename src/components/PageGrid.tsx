@@ -27,7 +27,7 @@ import {
   type MouseEvent,
 } from "react";
 
-import type { PdfDocument, PdfPage, PdfPagePreview } from "../domain/pdf";
+import type { PdfDocument, PdfPage, PdfPagePreview, ThumbnailLayoutMode } from "../domain/pdf";
 import type { RenderQualitySettings } from "../domain/pdfSettings";
 import { getFriendlyLoadError, renderDocumentPages } from "../services/pdfLoader";
 import type { DocumentAction } from "../state/documentReducer";
@@ -53,12 +53,15 @@ interface PreviewRect {
   y: number;
 }
 
-const MAX_PREVIEW_BATCH_SIZE = 1;
+const MAX_PREVIEW_BATCH_SIZE = 2;
 const PREVIEW_ROW_OVERSCAN = 2;
 const SCROLL_IDLE_PREVIEW_COMMIT_DELAY = 260;
 const PREVIEW_PRIORITY_PAUSE_POLL_MS = 30;
-const BACKGROUND_BATCH_DELAY = 12;
-const ACTIVE_SCROLL_BATCH_DELAY = 90;
+const BACKGROUND_BATCH_DELAY = 4;
+const ACTIVE_SCROLL_BATCH_DELAY = 55;
+const DRAG_AUTO_SCROLL_EDGE_PX = 136;
+const DRAG_AUTO_SCROLL_MAX_SPEED = 34;
+const DRAG_AUTO_SCROLL_MIN_SPEED = 4;
 const PAGE_SLOT_BASE_WIDTH = 244;
 
 interface PageGridProps {
@@ -72,6 +75,8 @@ interface PageGridProps {
   onRequestDeletePage: (pageNumber: number) => void;
   pausePreviewLoading: boolean;
   renderQuality: RenderQualitySettings;
+  scrollToPageNumber: number | null;
+  onScrolledToPage: () => void;
 }
 
 export const PageGrid = memo(function PageGrid({
@@ -82,9 +87,11 @@ export const PageGrid = memo(function PageGrid({
   onOpenFullPreview,
   onPageEdited,
   onRequestDeletePage,
+  onScrolledToPage,
   onSmallPreviewComplete,
   pausePreviewLoading,
   renderQuality,
+  scrollToPageNumber,
 }: PageGridProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const isMountedRef = useRef(true);
@@ -95,9 +102,12 @@ export const PageGrid = memo(function PageGrid({
   const previewEntriesRef = useRef<Record<string, PreviewEntry>>({});
   const previewRefreshScheduledRef = useRef(false);
   const previewRefreshTimerRef = useRef<number | null>(null);
+  const dragAutoScrollFrameRef = useRef<number | null>(null);
+  const dragPointerYRef = useRef<number | null>(null);
   const [width, setWidth] = useState(0);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [previewVersion, setPreviewVersion] = useState(0);
+  const isDraggingPages = dragState !== null;
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: {
@@ -114,8 +124,80 @@ export const PageGrid = memo(function PageGrid({
       if (previewRefreshTimerRef.current !== null) {
         window.clearTimeout(previewRefreshTimerRef.current);
       }
+      if (dragAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragAutoScrollFrameRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    if (!isDraggingPages) {
+      dragPointerYRef.current = null;
+      if (dragAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragAutoScrollFrameRef.current);
+        dragAutoScrollFrameRef.current = null;
+      }
+      return;
+    }
+
+    const scheduleAutoScroll = () => {
+      if (dragAutoScrollFrameRef.current !== null) {
+        return;
+      }
+
+      dragAutoScrollFrameRef.current = window.requestAnimationFrame(runAutoScroll);
+    };
+
+    const runAutoScroll = () => {
+      dragAutoScrollFrameRef.current = null;
+
+      const scrollElement = scrollRef.current;
+      const pointerY = dragPointerYRef.current;
+      if (!scrollElement || pointerY === null) {
+        return;
+      }
+
+      const speed = getDragAutoScrollSpeed(pointerY, scrollElement.getBoundingClientRect());
+      if (speed === 0) {
+        return;
+      }
+
+      scrollElement.scrollTop += speed;
+      scheduleAutoScroll();
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      dragPointerYRef.current = event.clientY;
+      scheduleAutoScroll();
+    };
+
+    const handleWheel = (event: WheelEvent) => {
+      const scrollElement = scrollRef.current;
+      if (!scrollElement) {
+        return;
+      }
+
+      const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+      if (delta === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      scrollElement.scrollTop += delta;
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: true });
+    window.addEventListener("wheel", handleWheel, { capture: true, passive: false });
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("wheel", handleWheel, { capture: true });
+      if (dragAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragAutoScrollFrameRef.current);
+        dragAutoScrollFrameRef.current = null;
+      }
+    };
+  }, [isDraggingPages]);
 
   const schedulePreviewRefresh = useCallback(() => {
     if (previewRefreshScheduledRef.current) {
@@ -182,16 +264,41 @@ export const PageGrid = memo(function PageGrid({
     return () => resizeObserver.disconnect();
   }, []);
 
+  const largeColumns = getLargeLayoutColumns(document.thumbnailLayout);
   const columns = useMemo(() => {
+    if (largeColumns) {
+      return largeColumns;
+    }
+
     const cellWidth = PAGE_SLOT_BASE_WIDTH * document.thumbnailScale;
     return Math.max(1, Math.floor(Math.max(width, cellWidth) / cellWidth));
-  }, [document.thumbnailScale, width]);
+  }, [document.thumbnailScale, largeColumns, width]);
 
   const rowCount = Math.ceil(document.pages.length / columns);
-  const rowHeight = Math.round(226 * document.thumbnailScale + 42);
+  const largePageWidth = useMemo(() => {
+    if (!largeColumns) {
+      return null;
+    }
+
+    const viewportFitWidth =
+      typeof window === "undefined" ? 620 : Math.max(170, Math.floor((window.innerHeight - 210) / 1.44));
+    const maxLargeWidth =
+      largeColumns === 1
+        ? Math.min(640, viewportFitWidth)
+        : largeColumns === 2
+          ? Math.min(500, viewportFitWidth)
+          : Math.min(350, viewportFitWidth);
+    const availableWidth = Math.max(240, width - 34 * largeColumns - 30 * Math.max(0, largeColumns - 1) - 42);
+    return Math.round(Math.max(160, Math.min(maxLargeWidth, availableWidth / largeColumns)));
+  }, [largeColumns, width]);
+  const rowHeight = largePageWidth ? Math.round(largePageWidth * 1.44 + 104) : Math.round(226 * document.thumbnailScale + 42);
   const targetPreviewWidth = useMemo(() => {
-    return Math.round(renderQuality.smallWidth * document.thumbnailScale);
-  }, [document.thumbnailScale, renderQuality.smallWidth]);
+    return largePageWidth
+      ? Math.round(Math.max(renderQuality.smallWidth, Math.min(renderQuality.detailWidth, largePageWidth * 1.5)))
+      : Math.round(renderQuality.smallWidth * document.thumbnailScale);
+  }, [document.thumbnailScale, largePageWidth, renderQuality.detailWidth, renderQuality.smallWidth]);
+  const previewRenderLane = largePageWidth ? "full" : "thumbnail";
+  const previewJpegQuality = largePageWidth ? renderQuality.detailJpegQuality : renderQuality.smallJpegQuality;
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -202,6 +309,26 @@ export const PageGrid = memo(function PageGrid({
   });
   const isScrolling = rowVirtualizer.isScrolling;
   const virtualRows = rowVirtualizer.getVirtualItems();
+
+  useEffect(() => {
+    rowVirtualizer.measure();
+  }, [columns, document.thumbnailLayout, largePageWidth, rowHeight, rowVirtualizer, width]);
+
+  useEffect(() => {
+    if (!scrollToPageNumber || document.pages.length === 0) {
+      return;
+    }
+
+    const targetIndex = document.pages.findIndex((page) => page.pageNumber === scrollToPageNumber);
+    if (targetIndex < 0) {
+      onScrolledToPage();
+      return;
+    }
+
+    rowVirtualizer.scrollToIndex(Math.floor(targetIndex / columns), { align: "start" });
+    window.setTimeout(onScrolledToPage, 80);
+  }, [columns, document.pages, onScrolledToPage, rowVirtualizer, scrollToPageNumber]);
+
   const previewEntries = useMemo(() => previewEntriesRef.current, [previewVersion]);
   const movingPageNumbers = useMemo(() => {
     if (!dragState) {
@@ -248,7 +375,7 @@ export const PageGrid = memo(function PageGrid({
       previewRefreshTimerRef.current = null;
     }
     setPreviewVersion((version) => version + 1);
-  }, [document.id, renderQuality.smallJpegQuality, targetPreviewWidth]);
+  }, [document.id, previewJpegQuality, previewRenderLane, targetPreviewWidth]);
 
   useEffect(() => {
     if (!filePath || document.pages.length === 0) {
@@ -285,8 +412,8 @@ export const PageGrid = memo(function PageGrid({
 
         try {
           const renderedPreviews = await renderDocumentPages(sourcePath, pagesToRenderFromDocument, requestTargetPreviewWidth, {
-            jpegQuality: renderQuality.smallJpegQuality,
-            renderLane: "thumbnail",
+            jpegQuality: previewJpegQuality,
+            renderLane: previewRenderLane,
           });
           if (isCancelled || !isMountedRef.current || loadRunIdRef.current !== requestRunId) {
             return;
@@ -350,8 +477,9 @@ export const PageGrid = memo(function PageGrid({
     document.pages,
     filePath,
     onSmallPreviewComplete,
+    previewJpegQuality,
+    previewRenderLane,
     queuePreviewEntries,
-    renderQuality.smallJpegQuality,
     schedulePreviewRefresh,
     targetPreviewWidth,
   ]);
@@ -415,7 +543,7 @@ export const PageGrid = memo(function PageGrid({
       onDragOver={handleDragOver}
       onDragStart={handleDragStart}
     >
-      <div className={`page-grid-scroll ${isScrolling ? "is-scrolling" : ""} ${dragState ? "is-dragging-pages" : ""}`} ref={scrollRef}>
+      <div className={`page-grid-scroll ${isScrolling ? "is-scrolling" : ""} ${isDraggingPages ? "is-dragging-pages" : ""}`} ref={scrollRef}>
         <div className="virtual-canvas" style={{ height: rowVirtualizer.getTotalSize() }}>
           {virtualRows.map((virtualRow) => {
             const start = virtualRow.index * columns;
@@ -433,11 +561,11 @@ export const PageGrid = memo(function PageGrid({
                 <div className="page-row" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
                   {rowPages.map((page) => (
                     <PageSlot
-                      beforeNextPage={page.pageNumber + 1}
-                      canCutAfter={page.pageNumber < document.pages.length}
+                      beforePage={page.pageNumber}
+                      canCutBefore={page.pageNumber > 1}
                       dispatch={dispatch}
-                      hoverEnabled={document.hoverZoomEnabled && !isScrolling && !dragState}
-                      isCut={document.cutBeforePages.has(page.pageNumber + 1)}
+                      hoverEnabled={document.hoverZoomEnabled && !isScrolling && !isDraggingPages}
+                      isCut={document.cutBeforePages.has(page.pageNumber)}
                       isDragMoving={movingPageNumbers.has(page.pageNumber)}
                       isDropAfter={dragState?.dropBeforePageNumber === document.pages.length + 1 && page.pageNumber === document.pages.length}
                       isDropBefore={dragState?.dropBeforePageNumber === page.pageNumber}
@@ -449,6 +577,7 @@ export const PageGrid = memo(function PageGrid({
                       onPageEdited={onPageEdited}
                       onRequestDeletePage={onRequestDeletePage}
                       page={page}
+                      pageDisplayWidth={largePageWidth}
                       previewEntry={previewEntries[page.id]}
                       thumbnailScale={document.thumbnailScale}
                     />
@@ -469,8 +598,8 @@ export const PageGrid = memo(function PageGrid({
 });
 
 interface PageSlotProps {
-  beforeNextPage: number;
-  canCutAfter: boolean;
+  beforePage: number;
+  canCutBefore: boolean;
   dispatch: Dispatch<DocumentAction>;
   hoverEnabled: boolean;
   isCut: boolean;
@@ -484,13 +613,14 @@ interface PageSlotProps {
   onPageEdited: () => void;
   onRequestDeletePage: (pageNumber: number) => void;
   page: PdfPage;
+  pageDisplayWidth: number | null;
   previewEntry: PreviewEntry | undefined;
   thumbnailScale: number;
 }
 
 const PageSlot = memo(function PageSlot({
-  beforeNextPage,
-  canCutAfter,
+  beforePage,
+  canCutBefore,
   dispatch,
   hoverEnabled,
   isCut,
@@ -505,6 +635,7 @@ const PageSlot = memo(function PageSlot({
   onPageEdited,
   onRequestDeletePage,
   previewEntry,
+  pageDisplayWidth,
   thumbnailScale,
 }: PageSlotProps) {
   function handlePageClick(event: MouseEvent<HTMLButtonElement>) {
@@ -516,8 +647,8 @@ const PageSlot = memo(function PageSlot({
   }
 
   function handleCutClick() {
-    if (canCutAfter) {
-      dispatch({ type: "toggle-cut", beforePage: beforeNextPage });
+    if (canCutBefore) {
+      dispatch({ type: "toggle-cut", beforePage });
     }
   }
 
@@ -550,12 +681,34 @@ const PageSlot = memo(function PageSlot({
   return (
     <div
       className={`page-slot ${isDropBefore ? "is-drop-before" : ""} ${isDropAfter ? "is-drop-after" : ""}`}
-      style={{ "--scale": thumbnailScale } as CSSProperties}
+      style={
+        {
+          "--scale": thumbnailScale,
+          ...(pageDisplayWidth ? { "--thumb-width": `${pageDisplayWidth}px` } : null),
+        } as CSSProperties
+      }
     >
       <PageDropZone pageNumber={page.pageNumber} position="before" />
       <PageDropZone pageNumber={page.pageNumber} position="after" />
       <span className="page-drop-indicator is-before" aria-hidden="true" />
       <span className="page-drop-indicator is-after" aria-hidden="true" />
+      {canCutBefore ? (
+        <button
+          className={`cut-separator is-enabled ${isCut ? "is-cut" : ""}`}
+          type="button"
+          aria-label={`Toggle split before page ${beforePage}`}
+          onClick={handleCutClick}
+        >
+          <span className="cut-line" />
+          {isCut ? (
+            <span className="cut-badge" aria-hidden="true">
+              <Scissors size={13} strokeWidth={2.6} />
+            </span>
+          ) : null}
+        </button>
+      ) : (
+        <span className="cut-separator-placeholder" aria-hidden="true" />
+      )}
       <div
         ref={setDraggableNodeRef}
         className={`page-card ${isSelected ? "is-selected" : ""} ${page.tinted ? "is-marked" : ""} ${isDragMoving ? "is-drag-moving" : ""}`}
@@ -613,22 +766,6 @@ const PageSlot = memo(function PageSlot({
           </button>
         </div>
       </div>
-
-      {canCutAfter ? (
-        <button
-          className={`cut-separator is-enabled ${isCut ? "is-cut" : ""}`}
-          type="button"
-          aria-label={`Toggle split before page ${beforeNextPage}`}
-          onClick={handleCutClick}
-        >
-          <span className="cut-line" />
-          {isCut ? (
-            <span className="cut-badge" aria-hidden="true">
-              <Scissors size={13} strokeWidth={2.6} />
-            </span>
-          ) : null}
-        </button>
-      ) : null}
     </div>
   );
 });
@@ -677,6 +814,9 @@ function PagePreview({ page, previewEntry }: { page: PdfPage; previewEntry: Prev
 
 function PreviewImage({ page, preview }: { page: PdfPage; preview: PdfPagePreview }) {
   const isSideways = page.rotation === 90 || page.rotation === 270;
+  const sourceRatio = preview.width / Math.max(1, preview.height);
+  const displayRatio = isSideways ? 1 / Math.max(0.001, sourceRatio) : sourceRatio;
+  const contentPlacement = getPreviewContentPlacement(displayRatio);
   const crop = getActiveThumbnailCrop(page);
   const visualCrop = rectToVisualRect(crop, page.rotation);
   const straightenDegrees = getThumbnailStraightenDegrees(page);
@@ -691,7 +831,12 @@ function PreviewImage({ page, preview }: { page: PdfPage; preview: PdfPagePrevie
           "--crop-left": `${visualCrop.x * 100}%`,
           "--crop-right": `${(1 - visualCrop.x - visualCrop.width) * 100}%`,
           "--crop-top": `${visualCrop.y * 100}%`,
+          "--content-height": `${contentPlacement.height}%`,
+          "--content-left": `${contentPlacement.left}%`,
+          "--content-top": `${contentPlacement.top}%`,
+          "--content-width": `${contentPlacement.width}%`,
           "--page-ratio": `${preview.width} / ${preview.height}`,
+          "--source-ratio-value": sourceRatio,
           "--rotation": `${page.rotation}deg`,
           "--straighten": `${straightenDegrees}deg`,
           "--straighten-scale": straightenScale,
@@ -793,6 +938,29 @@ function rectToVisualRect(rect: PreviewRect, rotation: number): PreviewRect {
   return normalizedRect(start, end);
 }
 
+function getPreviewContentPlacement(displayRatio: number): { height: number; left: number; top: number; width: number } {
+  const frameRatio = 0.72;
+  const safeRatio = Math.max(0.001, displayRatio);
+
+  if (safeRatio > frameRatio) {
+    const height = (frameRatio / safeRatio) * 100;
+    return {
+      height,
+      left: 0,
+      top: (100 - height) / 2,
+      width: 100,
+    };
+  }
+
+  const width = (safeRatio / frameRatio) * 100;
+  return {
+    height: 100,
+    left: (100 - width) / 2,
+    top: 0,
+    width,
+  };
+}
+
 function rectStyle(rect: PreviewRect): CSSProperties {
   return {
     height: `${rect.height * 100}%`,
@@ -844,6 +1012,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function getLargeLayoutColumns(layout: ThumbnailLayoutMode): number | null {
+  switch (layout) {
+    case "large1":
+      return 1;
+    case "large2":
+      return 2;
+    case "large3":
+      return 3;
+    default:
+      return null;
+  }
+}
+
 function getActiveThumbnailCrop(page: PdfPage): { height: number; width: number; x: number; y: number } {
   for (let index = page.paintEdits.length - 1; index >= 0; index -= 1) {
     const edit = page.paintEdits[index];
@@ -878,6 +1059,35 @@ function getThumbnailStraightenScale(degrees: number): number {
   const rotatedWidth = width * Math.cos(radians) + height * Math.sin(radians);
   const rotatedHeight = width * Math.sin(radians) + height * Math.cos(radians);
   return Math.min(width / rotatedWidth, height / rotatedHeight) * 0.985;
+}
+
+function getDragAutoScrollSpeed(pointerY: number, scrollRect: DOMRect): number {
+  const viewportHeight = window.innerHeight;
+  const topEdge = Math.max(0, Math.min(scrollRect.top, viewportHeight));
+  const bottomEdge = Math.max(0, Math.min(scrollRect.bottom, viewportHeight));
+  const topDistance = Math.min(DRAG_AUTO_SCROLL_EDGE_PX, Math.max(0, pointerY - topEdge));
+  const bottomDistance = Math.min(DRAG_AUTO_SCROLL_EDGE_PX, Math.max(0, bottomEdge - pointerY));
+
+  if (pointerY <= topEdge || topDistance < DRAG_AUTO_SCROLL_EDGE_PX) {
+    const pressure = pointerY <= topEdge ? 1 : 1 - topDistance / DRAG_AUTO_SCROLL_EDGE_PX;
+    return -getDragAutoScrollVelocity(pressure);
+  }
+
+  if (pointerY >= bottomEdge || bottomDistance < DRAG_AUTO_SCROLL_EDGE_PX) {
+    const pressure = pointerY >= bottomEdge ? 1 : 1 - bottomDistance / DRAG_AUTO_SCROLL_EDGE_PX;
+    return getDragAutoScrollVelocity(pressure);
+  }
+
+  return 0;
+}
+
+function getDragAutoScrollVelocity(pressure: number): number {
+  const normalizedPressure = Math.min(1, Math.max(0, pressure));
+  if (normalizedPressure <= 0) {
+    return 0;
+  }
+
+  return Math.round(DRAG_AUTO_SCROLL_MIN_SPEED + DRAG_AUTO_SCROLL_MAX_SPEED * normalizedPressure * normalizedPressure);
 }
 
 function sleep(milliseconds: number): Promise<void> {

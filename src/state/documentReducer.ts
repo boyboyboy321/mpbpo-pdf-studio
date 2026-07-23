@@ -1,6 +1,17 @@
-import type { InsertPageMetadata, PdfDocument, PdfMetadata, PdfPage, PdfPagePaintEdit, SplitOutputMode } from "../domain/pdf";
+import type {
+  InsertPageMetadata,
+  PdfDocument,
+  PdfDocumentUndoSnapshot,
+  PdfMetadata,
+  PdfPage,
+  PdfPagePaintEdit,
+  SplitOutputMode,
+  ThumbnailLayoutMode,
+} from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import { clampRenderQualitySettings, THUMBNAIL_SCALE_MAX, THUMBNAIL_SCALE_MIN } from "../domain/pdfSettings";
+
+const MAX_PREVIEW_UNDO_STEPS = 40;
 
 export type DocumentAction =
   | { type: "open"; document: PdfDocument }
@@ -11,6 +22,7 @@ export type DocumentAction =
   | { type: "toggle-each-page-split" }
   | { type: "insert-pages-after-selection"; pages: InsertPageMetadata[] }
   | { type: "move-pages"; draggedPageNumber: number; beforePageNumber: number }
+  | { type: "undo-preview-edit" }
   | { type: "add-page-paint-edit"; edit: PdfPagePaintEdit; pageNumber: number }
   | { type: "remove-page-paint-edit"; editId: string; pageNumber: number }
   | { type: "undo-page-paint-edit"; pageNumber: number }
@@ -27,6 +39,7 @@ export type DocumentAction =
   | { type: "set-custom-render-quality"; settings: RenderQualitySettings }
   | { type: "set-split-custom-output-folder"; folder: string | null }
   | { type: "set-split-output-mode"; mode: SplitOutputMode }
+  | { type: "set-thumbnail-layout"; layout: ThumbnailLayoutMode }
   | { type: "set-thumbnail-scale"; scale: number };
 
 export function documentReducer(state: PdfDocument | null, action: DocumentAction): PdfDocument | null {
@@ -47,6 +60,8 @@ export function documentReducer(state: PdfDocument | null, action: DocumentActio
       return state ? insertPagesAfterSelection(state, action.pages) : state;
     case "move-pages":
       return state ? movePagesBefore(state, action.draggedPageNumber, action.beforePageNumber) : state;
+    case "undo-preview-edit":
+      return state ? undoPreviewEdit(state) : state;
     case "add-page-paint-edit":
       return state ? addPagePaintEdit(state, action.pageNumber, action.edit) : state;
     case "remove-page-paint-edit":
@@ -81,6 +96,8 @@ export function documentReducer(state: PdfDocument | null, action: DocumentActio
       return state ? { ...state, splitCustomOutputFolder: action.folder } : state;
     case "set-split-output-mode":
       return state ? { ...state, splitOutputMode: action.mode } : state;
+    case "set-thumbnail-layout":
+      return state ? { ...state, thumbnailLayout: action.layout } : state;
     case "set-thumbnail-scale":
       return state ? { ...state, thumbnailScale: clampThumbnailScale(action.scale) } : state;
     default:
@@ -199,7 +216,7 @@ function insertPagesAfterSelection(document: PdfDocument, pages: InsertPageMetad
     selectedPages.add(firstInsertedPageNumber + offset);
   }
 
-  return markDirty(
+  const nextDocument = markDirty(
     {
       ...normalizePageStructure({
         ...document,
@@ -211,6 +228,8 @@ function insertPagesAfterSelection(document: PdfDocument, pages: InsertPageMetad
       selectedPages,
     },
   );
+
+  return { ...nextDocument, previewUndoStack: [] };
 }
 
 function addPagePaintEdit(document: PdfDocument, pageNumber: number, edit: PdfPagePaintEdit): PdfDocument {
@@ -277,7 +296,7 @@ function deletePages(document: PdfDocument, pageNumbersToDelete: Set<number>): P
   const nextPages = document.pages.filter((page) => !pageNumbersToDelete.has(page.pageNumber));
   const nextSelectedPageNumber = Math.min(Math.max(1, firstDeletedPageNumber), nextPages.length);
 
-  return markDirty(
+  const nextDocument = markDirty(
     {
       ...normalizePageStructure({
         ...document,
@@ -289,6 +308,8 @@ function deletePages(document: PdfDocument, pageNumbersToDelete: Set<number>): P
       selectedPages: new Set([nextSelectedPageNumber]),
     },
   );
+
+  return withPreviewUndo(document, nextDocument, firstDeletedPageNumber);
 }
 
 function movePagesBefore(document: PdfDocument, draggedPageNumber: number, beforePageNumber: number): PdfDocument {
@@ -342,13 +363,13 @@ function movePagesBefore(document: PdfDocument, draggedPageNumber: number, befor
     }
   }
 
-  return markDirty({
+  return withPreviewUndo(document, markDirty({
     ...document,
     cutBeforePages,
     lastSelectedPageNumber: nextLastSelectedPageNumber,
     pages,
     selectedPages,
-  });
+  }), Math.min(...movingPageNumbers));
 }
 
 function normalizePageStructure(document: PdfDocument): PdfDocument {
@@ -395,10 +416,11 @@ function normalizePageStructure(document: PdfDocument): PdfDocument {
 function rebaseSavedDocument(document: PdfDocument, metadata: PdfMetadata): PdfDocument {
   const pages = document.pages.map((page, index): PdfPage => {
     const pageNumber = index + 1;
+    const needsPreviewRefresh = hasSavedVisualChanges(page);
 
     return {
       ...page,
-      id: `page-${pageNumber}-${crypto.randomUUID()}`,
+      id: needsPreviewRefresh ? `page-${pageNumber}-${crypto.randomUUID()}` : page.id,
       paintEdits: [],
       pageNumber,
       previewVariant: pageNumber % 6,
@@ -420,17 +442,57 @@ function rebaseSavedDocument(document: PdfDocument, metadata: PdfMetadata): PdfD
     ...document,
     fileName: metadata.fileName,
     filePath: metadata.filePath,
-    id: crypto.randomUUID(),
     isDirty: false,
     lastSelectedPageNumber: Math.min(document.lastSelectedPageNumber, Math.max(1, pages.length)),
     pages,
+    previewUndoStack: [],
     selectedPages,
     sizeBytes: metadata.sizeBytes,
   };
 }
 
+function hasSavedVisualChanges(page: PdfPage): boolean {
+  return page.rotation !== 0 || page.paintEdits.some(isMeaningfulPaintEdit);
+}
+
 function markDirty(document: PdfDocument): PdfDocument {
   return { ...document, isDirty: true };
+}
+
+function createPreviewUndoSnapshot(document: PdfDocument, focusPageNumber: number): PdfDocumentUndoSnapshot {
+  return {
+    cutBeforePages: [...document.cutBeforePages],
+    focusPageNumber,
+    lastSelectedPageNumber: document.lastSelectedPageNumber,
+    pages: document.pages,
+    selectedPages: [...document.selectedPages],
+  };
+}
+
+function withPreviewUndo(previousDocument: PdfDocument, nextDocument: PdfDocument, focusPageNumber: number): PdfDocument {
+  if (previousDocument === nextDocument) {
+    return nextDocument;
+  }
+
+  const previewUndoStack = [...previousDocument.previewUndoStack, createPreviewUndoSnapshot(previousDocument, focusPageNumber)].slice(-MAX_PREVIEW_UNDO_STEPS);
+  return { ...nextDocument, previewUndoStack };
+}
+
+function undoPreviewEdit(document: PdfDocument): PdfDocument {
+  const snapshot = document.previewUndoStack.at(-1);
+  if (!snapshot) {
+    return document;
+  }
+
+  return {
+    ...document,
+    cutBeforePages: new Set(snapshot.cutBeforePages),
+    isDirty: true,
+    lastSelectedPageNumber: snapshot.lastSelectedPageNumber,
+    pages: snapshot.pages,
+    previewUndoStack: document.previewUndoStack.slice(0, -1),
+    selectedPages: new Set(snapshot.selectedPages),
+  };
 }
 
 function clampPageNumber(pageNumber: number, pageCount: number): number {

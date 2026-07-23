@@ -59,6 +59,7 @@ export function createDocument(input: { filePath: string | null; fileName: strin
     lastSelectedPageNumber: 1,
     sizeBytes: input.sizeBytes,
     pages: createPages(Math.max(1, input.pageCount), input.filePath, input.fileName),
+    previewUndoStack: [],
     selectedPages: new Set([1]),
     cutBeforePages: new Set(),
     hoverZoomEnabled: false,
@@ -66,6 +67,7 @@ export function createDocument(input: { filePath: string | null; fileName: strin
     renderQualityPreset: preferences.renderQualityPreset,
     splitCustomOutputFolder: preferences.splitCustomOutputFolder,
     splitOutputMode: preferences.splitOutputMode,
+    thumbnailLayout: preferences.thumbnailLayout,
     thumbnailScale: preferences.thumbnailScale,
   });
 }

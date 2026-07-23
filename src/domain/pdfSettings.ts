@@ -12,13 +12,13 @@ export interface RenderQualitySettings {
 }
 
 export const RENDER_QUALITY_LIMITS = {
-  detailJpegQualityMax: 92,
+  detailJpegQualityMax: 96,
   detailJpegQualityMin: 45,
-  detailWidthMax: 2200,
+  detailWidthMax: 4200,
   detailWidthMin: 480,
-  smallJpegQualityMax: 92,
+  smallJpegQualityMax: 96,
   smallJpegQualityMin: 45,
-  smallWidthMax: 320,
+  smallWidthMax: 720,
   smallWidthMin: 72,
 } as const;
 
@@ -33,14 +33,14 @@ export const RENDER_QUALITY_PRESETS = {
   compact: {
     detailJpegQuality: 72,
     detailWidth: 840,
-    label: "Light",
+    label: "Light (best for 1/2/3)",
     smallJpegQuality: 58,
     smallWidth: 105,
   },
   balanced: {
     detailJpegQuality: 76,
     detailWidth: 900,
-    label: "Balanced",
+    label: "Balanced (Recommended)",
     smallJpegQuality: 66,
     smallWidth: 124,
   },
@@ -51,12 +51,19 @@ export const RENDER_QUALITY_PRESETS = {
     smallJpegQuality: 74,
     smallWidth: 150,
   },
-  original: {
+  ultra: {
     detailJpegQuality: 92,
     detailWidth: 2200,
-    label: "Original",
+    label: "Ultra",
     smallJpegQuality: 90,
     smallWidth: 220,
+  },
+  original: {
+    detailJpegQuality: 94,
+    detailWidth: 3200,
+    label: "Original (not recommended)",
+    smallJpegQuality: 92,
+    smallWidth: 280,
   },
   custom: {
     detailJpegQuality: 76,

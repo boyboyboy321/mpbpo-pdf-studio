@@ -58,6 +58,7 @@ import type {
   SplitOutputMode,
   SplitProgressEvent,
   SplitResult,
+  ThumbnailLayoutMode,
 } from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import {
@@ -204,9 +205,37 @@ const SPLIT_OUTPUT_OPTIONS: Record<SplitOutputMode, { description: string; label
   },
 };
 const SPLIT_OUTPUT_OPTION_LIST = Object.values(SPLIT_OUTPUT_OPTIONS);
+const THUMBNAIL_LAYOUT_OPTIONS: Array<{ label: string; mode: ThumbnailLayoutMode; title: string }> = [
+  { label: "Grid", mode: "grid", title: "Automatic thumbnail grid" },
+  { label: "1", mode: "large1", title: "Show 1 large page per row" },
+  { label: "2", mode: "large2", title: "Show 2 large pages per row" },
+  { label: "3", mode: "large3", title: "Show 3 large pages per row" },
+];
 
 function getSplitOutputOption(mode: SplitOutputMode) {
   return SPLIT_OUTPUT_OPTIONS[mode];
+}
+
+interface SplitSegmentPreview {
+  cutBeforePage: number | null;
+  endPage: number;
+  fileName: string;
+  index: number;
+  startPage: number;
+}
+
+function buildSplitSegments(fileName: string, pageCount: number, cuts: number[]): SplitSegmentPreview[] {
+  const baseName = fileName.replace(/\.pdf$/i, "") || "document";
+  const starts = [1, ...cuts];
+  const ends = [...cuts.map((cut) => cut - 1), pageCount];
+
+  return starts.map((startPage, index) => ({
+    cutBeforePage: index === 0 ? null : startPage,
+    endPage: ends[index] ?? pageCount,
+    fileName: `${baseName}_${String(index + 1).padStart(3, "0")}.pdf`,
+    index: index + 1,
+    startPage,
+  }));
 }
 
 export function EditorView({
@@ -223,14 +252,21 @@ export function EditorView({
 }: EditorViewProps) {
   const hoverFrameRef = useRef<number | null>(null);
   const eachPageSplitCheckboxRef = useRef<HTMLInputElement | null>(null);
+  const cutListRef = useRef<HTMLDivElement | null>(null);
+  const previousCutsRef = useRef<Set<number>>(new Set(document.cutBeforePages));
   const splitLocationMenuRef = useRef<HTMLDivElement | null>(null);
   const splitRunningRef = useRef(false);
   const pendingHoverRef = useRef<HoverState | null>(null);
   const detailFailedPagesRef = useRef<Set<string>>(new Set());
   const detailPreviewsRef = useRef<Record<string, PdfPagePreview>>({});
-  const detailPriorityPagesRef = useRef<Set<number>>(new Set());
-  const detailPriorityQueueRef = useRef<number[]>([]);
+  const detailBackgroundCursorRef = useRef(1);
+  const detailFilePathRef = useRef<string | null>(document.filePath);
+  const detailPageIdsRef = useRef<string[]>(document.pages.map((page) => page.id));
+  const detailPagesRef = useRef<PdfPage[]>(document.pages);
+  const detailPriorityPagesRef = useRef<Set<string>>(new Set());
+  const detailPriorityQueueRef = useRef<string[]>([]);
   const detailRunRef = useRef(0);
+  const fileWriteRunningRef = useRef(false);
   const closeBypassRef = useRef(false);
   const smallPreviewCompleteRef = useRef(false);
   const [fullPreview, setFullPreview] = useState<FullPreviewState | null>(null);
@@ -241,6 +277,7 @@ export function EditorView({
   const [closeConfirmationOpen, setCloseConfirmationOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [splitLocationMenuOpen, setSplitLocationMenuOpen] = useState(false);
+  const [pageScrollTarget, setPageScrollTarget] = useState<number | null>(null);
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
   const [splitState, setSplitState] = useState<SplitState>({ status: "idle" });
 
@@ -255,10 +292,12 @@ export function EditorView({
   const renderQualitySignature = `${renderQuality.smallWidth}:${renderQuality.smallJpegQuality}:${renderQuality.detailWidth}:${renderQuality.detailJpegQuality}`;
   const pageCacheSignature = useMemo(() => document.pages.map((page) => page.id).join("|"), [document.pages]);
   const sortedCuts = useMemo(() => [...document.cutBeforePages].sort((a, b) => a - b), [document.cutBeforePages]);
+  const splitSegments = useMemo(() => buildSplitSegments(document.fileName, document.pages.length, sortedCuts), [document.fileName, document.pages.length, sortedCuts]);
   const totalPossibleCuts = Math.max(0, document.pages.length - 1);
   const isEachPageSplit = totalPossibleCuts > 0 && sortedCuts.length === totalPossibleCuts;
   const isPartialEachPageSplit = sortedCuts.length > 0 && !isEachPageSplit;
   const canSplit = Boolean(document.filePath) && sortedCuts.length > 0 && splitState.status !== "running" && !busyJob;
+  const fileWriteRunning = Boolean(busyJob) || saveState.status === "running" || splitState.status === "running";
   const splitOutputOption = getSplitOutputOption(document.splitOutputMode);
   const splitOutputDescription =
     document.splitOutputMode === "customFolder" && document.splitCustomOutputFolder
@@ -282,6 +321,22 @@ export function EditorView({
       eachPageSplitCheckboxRef.current.indeterminate = isPartialEachPageSplit;
     }
   }, [isPartialEachPageSplit]);
+
+  useEffect(() => {
+    const previousCuts = previousCutsRef.current;
+    const addedCuts = sortedCuts.filter((cut) => !previousCuts.has(cut));
+    previousCutsRef.current = new Set(sortedCuts);
+
+    if (!cutListRef.current || addedCuts.length === 0) {
+      return;
+    }
+
+    const latestCut = addedCuts.at(-1);
+    window.setTimeout(() => {
+      const target = cutListRef.current?.querySelector<HTMLElement>(`[data-cut-before-page="${latestCut}"]`);
+      target?.scrollIntoView({ block: "nearest" });
+    }, 0);
+  }, [sortedCuts]);
 
   useEffect(() => {
     const hasDismissableToast =
@@ -328,6 +383,10 @@ export function EditorView({
       setSplitLocationMenuOpen(false);
     }
   }, [splitState.status]);
+
+  useEffect(() => {
+    fileWriteRunningRef.current = fileWriteRunning;
+  }, [fileWriteRunning]);
 
   useEffect(() => {
     if (!splitLocationMenuOpen) {
@@ -395,8 +454,13 @@ export function EditorView({
   useEffect(() => {
     setSplitState({ status: "idle" });
     setFullPreview(null);
+    previousCutsRef.current = new Set(document.cutBeforePages);
     detailFailedPagesRef.current.clear();
     detailPreviewsRef.current = {};
+    detailBackgroundCursorRef.current = 1;
+    detailFilePathRef.current = document.filePath;
+    detailPageIdsRef.current = document.pages.map((page) => page.id);
+    detailPagesRef.current = document.pages;
     detailPriorityPagesRef.current.clear();
     detailPriorityQueueRef.current = [];
     smallPreviewCompleteRef.current = false;
@@ -404,23 +468,29 @@ export function EditorView({
     setDetailPreviewVersion((version) => version + 1);
   }, [document.id, renderQualitySignature]);
 
+  const queueDetailPriorityPage = useCallback((pageNumber: number, placement: "append" | "prepend" = "prepend") => {
+    const page = detailPagesRef.current[pageNumber - 1];
+    if (!page) {
+      return false;
+    }
+
+    if (detailPreviewsRef.current[page.id] || detailPriorityPagesRef.current.has(page.id)) {
+      return false;
+    }
+
+    detailFailedPagesRef.current.delete(page.id);
+    detailPriorityPagesRef.current.add(page.id);
+    const queuedPages = detailPriorityQueueRef.current.filter((queuedPageId) => queuedPageId !== page.id);
+    detailPriorityQueueRef.current = placement === "append" ? [...queuedPages, page.id] : [page.id, ...queuedPages];
+    setDetailPriorityActive(true);
+    return true;
+  }, []);
+
   const requestDetailPreview = useCallback(
     (pageNumber: number) => {
-      const page = document.pages[pageNumber - 1];
-      if (!page) {
-        return;
-      }
-
-      if (detailPreviewsRef.current[page.id] || detailPriorityPagesRef.current.has(pageNumber)) {
-        return;
-      }
-
-      detailFailedPagesRef.current.delete(page.id);
-      detailPriorityPagesRef.current.add(pageNumber);
-      detailPriorityQueueRef.current = [pageNumber, ...detailPriorityQueueRef.current.filter((queuedPage) => queuedPage !== pageNumber)];
-      setDetailPriorityActive(true);
+      queueDetailPriorityPage(pageNumber);
     },
-    [document.pages],
+    [queueDetailPriorityPage],
   );
 
   const handleSmallPreviewComplete = useCallback(() => {
@@ -432,47 +502,98 @@ export function EditorView({
   }, [pageCacheSignature]);
 
   useEffect(() => {
+    const previousPageIds = detailPageIdsRef.current;
+    const previousPageIdSet = new Set(previousPageIds);
+    const currentPageIds = document.pages.map((page) => page.id);
+    const currentPageIdSet = new Set(currentPageIds);
+    let shouldRefreshPreviewVersion = false;
+
+    detailFilePathRef.current = document.filePath;
+    detailPagesRef.current = document.pages;
+    detailPageIdsRef.current = currentPageIds;
+
+    for (const pageId of Object.keys(detailPreviewsRef.current)) {
+      if (!currentPageIdSet.has(pageId)) {
+        delete detailPreviewsRef.current[pageId];
+        shouldRefreshPreviewVersion = true;
+      }
+    }
+
+    for (const pageId of [...detailFailedPagesRef.current]) {
+      if (!currentPageIdSet.has(pageId)) {
+        detailFailedPagesRef.current.delete(pageId);
+      }
+    }
+
+    detailPriorityQueueRef.current = detailPriorityQueueRef.current.filter((pageId) => {
+      const isStillValid = currentPageIdSet.has(pageId);
+      if (!isStillValid) {
+        detailPriorityPagesRef.current.delete(pageId);
+      }
+
+      return isStillValid;
+    });
+
+    if (detailBackgroundCursorRef.current > document.pages.length + 1) {
+      detailBackgroundCursorRef.current = document.pages.length + 1;
+    }
+
+    for (const page of document.pages) {
+      if (!previousPageIdSet.has(page.id) && queueDetailPriorityPage(page.pageNumber, "append")) {
+        shouldRefreshPreviewVersion = true;
+      }
+    }
+
+    if (detailPriorityQueueRef.current.length === 0) {
+      setDetailPriorityActive(false);
+    }
+
+    if (shouldRefreshPreviewVersion) {
+      startTransition(() => {
+        setDetailPreviewVersion((version) => version + 1);
+      });
+    }
+  }, [document.filePath, document.pages, queueDetailPriorityPage]);
+
+  useEffect(() => {
     detailRunRef.current += 1;
-    detailPriorityPagesRef.current.clear();
-    detailPriorityQueueRef.current = [];
     startTransition(() => {
       setDetailPreviewVersion((version) => version + 1);
     });
 
-    if (!document.filePath || document.pages.length === 0) {
+    if (!detailFilePathRef.current || detailPagesRef.current.length === 0) {
       return;
     }
 
     const runId = detailRunRef.current;
-    const sourcePath = document.filePath;
     let isCancelled = false;
 
     async function renderDetailCache() {
-      let nextBackgroundPage = 1;
-
       while (!isCancelled && detailRunRef.current === runId) {
-        if (splitRunningRef.current) {
+        if (fileWriteRunningRef.current || splitRunningRef.current) {
           setDetailPriorityActive(false);
           await sleep(DETAIL_IDLE_DELAY_MS);
           continue;
         }
 
-        const priorityPageNumber = detailPriorityQueueRef.current.shift();
+        const priorityPageId = detailPriorityQueueRef.current.shift();
         const pageNumbers: number[] = [];
 
-        if (priorityPageNumber !== undefined) {
-          detailPriorityPagesRef.current.delete(priorityPageNumber);
-          const priorityPage = document.pages[priorityPageNumber - 1];
+        if (priorityPageId !== undefined) {
+          detailPriorityPagesRef.current.delete(priorityPageId);
+          const priorityPage = detailPagesRef.current.find((page) => page.id === priorityPageId);
 
           if (priorityPage && !detailPreviewsRef.current[priorityPage.id]) {
             detailFailedPagesRef.current.delete(priorityPage.id);
-            pageNumbers.push(priorityPageNumber);
+            pageNumbers.push(priorityPage.pageNumber);
           }
         } else if (smallPreviewCompleteRef.current) {
-          while (nextBackgroundPage <= document.pages.length && pageNumbers.length < DETAIL_BACKGROUND_BATCH_SIZE) {
-            const pageNumber = nextBackgroundPage;
-            nextBackgroundPage += 1;
-            const page = document.pages[pageNumber - 1];
+          const pages = detailPagesRef.current;
+
+          while (detailBackgroundCursorRef.current <= pages.length && pageNumbers.length < DETAIL_BACKGROUND_BATCH_SIZE) {
+            const pageNumber = detailBackgroundCursorRef.current;
+            detailBackgroundCursorRef.current += 1;
+            const page = pages[pageNumber - 1];
 
             if (!page || detailPreviewsRef.current[page.id] || detailFailedPagesRef.current.has(page.id)) {
               continue;
@@ -491,9 +612,18 @@ export function EditorView({
           continue;
         }
 
+        let pagesToRender: PdfPage[] = [];
+
         try {
-          const pagesToRender = pageNumbers
-            .map((pageNumber) => document.pages[pageNumber - 1])
+          const pages = detailPagesRef.current;
+          const sourcePath = detailFilePathRef.current;
+          if (!sourcePath) {
+            await sleep(DETAIL_IDLE_DELAY_MS);
+            continue;
+          }
+
+          pagesToRender = pageNumbers
+            .map((pageNumber) => pages[pageNumber - 1])
             .filter((page): page is PdfPage => Boolean(page));
           const renderedPreviews = await renderDocumentPages(sourcePath, pagesToRender, renderQuality.detailWidth, {
             jpegQuality: renderQuality.detailJpegQuality,
@@ -504,10 +634,11 @@ export function EditorView({
           }
 
           const pageIdsByNumber = new Map(pagesToRender.map((page) => [page.pageNumber, page.id]));
+          const livePageIds = new Set(detailPagesRef.current.map((page) => page.id));
           const renderedPageIds = new Set<string>();
           for (const preview of renderedPreviews) {
             const pageId = pageIdsByNumber.get(preview.pageNumber);
-            if (!pageId) {
+            if (!pageId || !livePageIds.has(pageId)) {
               continue;
             }
 
@@ -526,11 +657,8 @@ export function EditorView({
           }
 
           console.error("Detail preview render failed.", error);
-          for (const pageNumber of pageNumbers) {
-            const page = document.pages[pageNumber - 1];
-            if (page) {
-              detailFailedPagesRef.current.add(page.id);
-            }
+          for (const page of pagesToRender) {
+            detailFailedPagesRef.current.add(page.id);
           }
         }
 
@@ -549,7 +677,7 @@ export function EditorView({
     return () => {
       isCancelled = true;
     };
-  }, [document.filePath, document.id, document.pages, renderQuality.detailJpegQuality, renderQuality.detailWidth]);
+  }, [document.id, renderQuality.detailJpegQuality, renderQuality.detailWidth]);
 
   const hoveredPageNumber = hovered?.page.pageNumber ?? null;
   const hoveredPage = hoveredPageNumber === null ? null : (document.pages.find((page) => page.pageNumber === hoveredPageNumber) ?? null);
@@ -607,6 +735,15 @@ export function EditorView({
     setHovered(null);
   }, []);
 
+  const focusPreviewPage = useCallback(
+    (pageNumber: number) => {
+      const safePageNumber = Math.min(Math.max(1, pageNumber), document.pages.length);
+      dispatch({ type: "select-page", pageNumber: safePageNumber, selectionMode: "single" });
+      setPageScrollTarget(safePageNumber);
+    },
+    [dispatch, document.pages.length],
+  );
+
   const openFullPreviewPage = useCallback(
     (pageNumber: number, initialTool: DetailTool = "hand") => {
       const page = document.pages[pageNumber - 1];
@@ -615,6 +752,7 @@ export function EditorView({
         return;
       }
 
+      focusPreviewPage(pageNumber);
       const preview = detailPreviewsRef.current[page.id] ?? null;
       setFullPreview({ initialTool, page, preview, status: preview ? "ready" : "loading" });
 
@@ -627,7 +765,7 @@ export function EditorView({
         requestDetailPreview(pageNumber);
       }
     },
-    [document.filePath, document.pages, requestDetailPreview],
+    [document.filePath, document.pages, focusPreviewPage, requestDetailPreview],
   );
 
   const handleOpenFullPreview = useCallback(
@@ -643,6 +781,18 @@ export function EditorView({
       setSaveState({ status: "idle" });
     },
     [dispatch],
+  );
+
+  const handleToggleCutBeforePage = useCallback(
+    (pageNumber: number) => {
+      if (pageNumber <= 1) {
+        return;
+      }
+
+      dispatch({ type: "toggle-cut", beforePage: pageNumber });
+      focusPreviewPage(pageNumber);
+    },
+    [dispatch, focusPreviewPage],
   );
 
   const handleCloseFullPreview = useCallback(() => {
@@ -861,6 +1011,17 @@ export function EditorView({
         return;
       }
 
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        const undoTargetPageNumber = document.previewUndoStack.at(-1)?.focusPageNumber ?? null;
+        dispatch({ type: "undo-preview-edit" });
+        if (undoTargetPageNumber !== null) {
+          setPageScrollTarget(undoTargetPageNumber);
+        }
+        setSaveState({ status: "idle" });
+        return;
+      }
+
       if (event.key === "Delete") {
         event.preventDefault();
         handleDeleteSelectedPages();
@@ -1042,6 +1203,7 @@ export function EditorView({
         <div className="document-title is-compact">
           <span>
             {document.pages.length} pages - {formatBytes(document.sizeBytes)}
+            {document.selectedPages.size > 1 ? ` - ${document.selectedPages.size} selected` : null}
             {saveState.status === "error" ? ` - ${saveState.message}` : null}
             {saveState.status === "success" ? " - Saved" : null}
           </span>
@@ -1104,8 +1266,10 @@ export function EditorView({
             onHoverEnd={handlePageHoverEnd}
             onPageEdited={handlePageEdited}
             onRequestDeletePage={(pageNumber) => requestDeletePages([pageNumber])}
-            pausePreviewLoading={detailPriorityActive || splitState.status === "running"}
+            onScrolledToPage={() => setPageScrollTarget(null)}
+            pausePreviewLoading={detailPriorityActive || fileWriteRunning}
             renderQuality={renderQuality}
+            scrollToPageNumber={pageScrollTarget}
           />
 
           {hovered && document.hoverZoomEnabled ? <Magnifier hover={hovered} zoomPreview={detailPreviewForHovered} /> : null}
@@ -1118,6 +1282,7 @@ export function EditorView({
               onPageChange={openFullPreviewPage}
               onRemovePaintEdit={handleRemovePagePaintEdit}
               onRotateClockwise={handleRotateFullPreview}
+              onToggleCutBeforePage={handleToggleCutBeforePage}
               onUndoPaintEdit={handleUndoPagePaintEdit}
               onUpdatePaintEdit={handleUpdatePagePaintEdit}
             />
@@ -1129,17 +1294,36 @@ export function EditorView({
         {document.detailPanelVisible ? (
           <aside className="detail-panel">
             <div className="detail-panel-header">
-              <label className="scale-control is-panel">
+              <label className={`scale-control is-panel ${document.thumbnailLayout !== "grid" ? "is-disabled" : ""}`}>
                 Thumbnail
                 <input
+                  disabled={document.thumbnailLayout !== "grid"}
                   min={THUMBNAIL_SCALE_MIN}
                   max={THUMBNAIL_SCALE_MAX}
                   step={THUMBNAIL_SCALE_STEP}
                   type="range"
                   value={document.thumbnailScale}
-                  onChange={(event) => dispatch({ type: "set-thumbnail-scale", scale: Number(event.currentTarget.value) })}
+                  onChange={(event) => {
+                    dispatch({ type: "set-thumbnail-scale", scale: Number(event.currentTarget.value) });
+                    if (document.thumbnailLayout !== "grid") {
+                      dispatch({ type: "set-thumbnail-layout", layout: "grid" });
+                    }
+                  }}
                 />
               </label>
+              <div className="thumbnail-layout-control" aria-label="Thumbnail layout">
+                {THUMBNAIL_LAYOUT_OPTIONS.map((option) => (
+                  <button
+                    key={option.mode}
+                    className={document.thumbnailLayout === option.mode ? "is-active" : ""}
+                    type="button"
+                    title={option.title}
+                    onClick={() => dispatch({ type: "set-thumbnail-layout", layout: option.mode })}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
               <button
                 className={`panel-toggle ${settingsOpen ? "is-active" : ""}`}
                 type="button"
@@ -1159,8 +1343,7 @@ export function EditorView({
                 <Menu size={18} />
               </button>
             </div>
-            <section className="panel-block split-options">
-              <h2>File split options</h2>
+            <section className="panel-block split-control-panel">
               <label className="check-row">
                 <input
                   ref={eachPageSplitCheckboxRef}
@@ -1171,26 +1354,42 @@ export function EditorView({
                 />
                 <span>Each page as a separate file</span>
               </label>
-            </section>
-
-            <section className="panel-block cut-points-panel">
-              <h2>Cut points</h2>
-              <div className="cut-list">
+              <div className="cut-list" ref={cutListRef}>
                 {sortedCuts.length === 0 ? (
                   <p>No split points yet.</p>
                 ) : (
-                  sortedCuts.map((cut) => (
-                    <button key={cut} type="button" onClick={() => dispatch({ type: "toggle-cut", beforePage: cut })}>
-                      Before page {cut}
+                  splitSegments.map((segment) => (
+                    <button
+                      className="cut-point-row"
+                      data-cut-before-page={segment.cutBeforePage ?? undefined}
+                      key={`${segment.index}:${segment.startPage}:${segment.endPage}`}
+                      type="button"
+                      title={`${segment.fileName} - Pages ${segment.startPage}-${segment.endPage}`}
+                      onClick={() => focusPreviewPage(segment.startPage)}
+                    >
+                      <span className="cut-point-index">{segment.index}</span>
+                      <span className="cut-point-copy">
+                        <strong>{segment.fileName}</strong>
+                        <small>Pages {segment.startPage}-{segment.endPage}</small>
+                      </span>
+                      {segment.cutBeforePage ? (
+                        <span
+                          className="cut-point-remove"
+                          role="button"
+                          tabIndex={-1}
+                          title={`Remove split before page ${segment.cutBeforePage}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            dispatch({ type: "toggle-cut", beforePage: segment.cutBeforePage ?? 0 });
+                          }}
+                        >
+                          <X size={16} />
+                        </span>
+                      ) : null}
                     </button>
                   ))
                 )}
               </div>
-            </section>
-
-            <section className="panel-block">
-              <h2>Output</h2>
-              <Metric label="Files planned" value={sortedCuts.length + 1} />
               <div className="split-location-control">
                 <label id="split-output-mode-label">Files location</label>
                 <div
@@ -1624,15 +1823,6 @@ function SaveToast({ onClose, state }: { onClose: () => void; state: SaveState }
         <X size={20} />
       </button>
     </aside>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="metric-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 
@@ -2083,6 +2273,7 @@ function FullPreviewOverlay({
   onPageChange,
   onRemovePaintEdit,
   onRotateClockwise,
+  onToggleCutBeforePage,
   onUndoPaintEdit,
   onUpdatePaintEdit,
 }: {
@@ -2093,6 +2284,7 @@ function FullPreviewOverlay({
   onPageChange: (pageNumber: number) => void;
   onRemovePaintEdit: (pageNumber: number, editId: string) => void;
   onRotateClockwise: (pageNumber: number) => void;
+  onToggleCutBeforePage: (pageNumber: number) => void;
   onUndoPaintEdit: (pageNumber: number) => void;
   onUpdatePaintEdit: (pageNumber: number, edit: PdfPagePaintEdit) => void;
 }) {
@@ -2246,6 +2438,11 @@ function FullPreviewOverlay({
 
       if (!isTyping && event.key === "Escape") {
         event.preventDefault();
+        if (activeTextEdit) {
+          finishActiveTextEdit();
+          return;
+        }
+
         if (tool !== "hand") {
           chooseTool("hand");
         } else {
@@ -2305,6 +2502,12 @@ function FullPreviewOverlay({
         return;
       }
 
+      if ((event.ctrlKey || event.metaKey) && key === "l") {
+        event.preventDefault();
+        onToggleCutBeforePage(state.page.pageNumber);
+        return;
+      }
+
       if ((event.ctrlKey || event.metaKey) && key === "z") {
         event.preventDefault();
         onUndoPaintEdit(state.page.pageNumber);
@@ -2328,7 +2531,18 @@ function FullPreviewOverlay({
 
     window.addEventListener("keydown", handlePreviewKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handlePreviewKeyDown, { capture: true });
-  }, [activeCrop, activeTextEdit, canGoNext, canGoPrevious, draftCrop, onRotateClockwise, onUndoPaintEdit, state.page.pageNumber, tool]);
+  }, [
+    activeCrop,
+    activeTextEdit,
+    canGoNext,
+    canGoPrevious,
+    draftCrop,
+    onRotateClockwise,
+    onToggleCutBeforePage,
+    onUndoPaintEdit,
+    state.page.pageNumber,
+    tool,
+  ]);
 
   function commitPageInput() {
     const parsedPage = Number.parseInt(pageInput, 10);
@@ -2354,6 +2568,12 @@ function FullPreviewOverlay({
     onRemovePaintEdit(state.page.pageNumber, activeTextEdit.id);
     setActiveTextEditId(null);
     return true;
+  }
+
+  function finishActiveTextEdit() {
+    if (!discardActiveEmptyTextEdit()) {
+      setActiveTextEditId(null);
+    }
   }
 
   function chooseTool(nextTool: DetailTool) {
@@ -2946,6 +3166,15 @@ function FullPreviewOverlay({
         <RotateCwSquare size={18} />
       </button>
       <i aria-hidden="true" />
+      <button
+        type="button"
+        aria-label="Cut before this page"
+        title={state.page.pageNumber <= 1 ? "Cannot cut before page 1" : "Cut before this page (Ctrl+L)"}
+        disabled={state.page.pageNumber <= 1}
+        onClick={() => onToggleCutBeforePage(state.page.pageNumber)}
+      >
+        <Scissors size={18} />
+      </button>
       <button type="button" aria-label="Undo last paint edit" title="Undo (Ctrl+Z)" disabled={!canUndoPaint} onClick={() => onUndoPaintEdit(state.page.pageNumber)}>
         <Undo2 size={18} />
       </button>
@@ -3105,6 +3334,7 @@ function FullPreviewOverlay({
                 tool={tool}
                 draftTextRect={draftTextRect}
                 onCropHandleStart={handleCropHandleStart}
+                onFinishTextBox={finishActiveTextEdit}
                 onMoveTextBoxStart={handleMoveTextBoxStart}
                 onRemoveTextBox={removeTextEdit}
                 onResizeTextBoxStart={handleResizeTextBoxStart}
@@ -3173,6 +3403,7 @@ function EditablePreviewImage({
   draftTextRect,
   editingCrop,
   onCropHandleStart,
+  onFinishTextBox,
   onMoveTextBoxStart,
   onRemoveTextBox,
   onResizeTextBoxStart,
@@ -3193,6 +3424,7 @@ function EditablePreviewImage({
   draftTextRect: DraftCoverRect | null;
   editingCrop: DraftCoverRect;
   onCropHandleStart: (event: ReactPointerEvent<HTMLElement>, handle: CropResizeHandle) => void;
+  onFinishTextBox: () => void;
   onMoveTextBoxStart: (event: ReactPointerEvent<HTMLButtonElement>, edit: Extract<PdfPagePaintEdit, { type: "text" }>) => void;
   onRemoveTextBox: (edit: Extract<PdfPagePaintEdit, { type: "text" }>) => void;
   onResizeTextBoxStart: (
@@ -3248,6 +3480,7 @@ function EditablePreviewImage({
           draftTextRect={draftTextRect}
           edits={page.paintEdits}
           onMoveTextBoxStart={onMoveTextBoxStart}
+          onFinishTextBox={onFinishTextBox}
           onRemoveTextBox={onRemoveTextBox}
           onResizeTextBoxStart={onResizeTextBoxStart}
           onTextChange={onTextChange}
@@ -3266,6 +3499,7 @@ function PaintEditsLayer({
   draftCoverColor,
   draftTextRect,
   edits,
+  onFinishTextBox,
   onMoveTextBoxStart,
   onRemoveTextBox,
   onResizeTextBoxStart,
@@ -3277,6 +3511,7 @@ function PaintEditsLayer({
   draftCoverColor: string;
   draftTextRect: DraftCoverRect | null;
   edits: PdfPagePaintEdit[];
+  onFinishTextBox: () => void;
   onMoveTextBoxStart: (event: ReactPointerEvent<HTMLButtonElement>, edit: Extract<PdfPagePaintEdit, { type: "text" }>) => void;
   onRemoveTextBox: (edit: Extract<PdfPagePaintEdit, { type: "text" }>) => void;
   onResizeTextBoxStart: (
@@ -3323,6 +3558,9 @@ function PaintEditsLayer({
               <button className="paint-text-box-delete" type="button" aria-label="Delete text box" title="Delete text box" onClick={() => onRemoveTextBox(edit)}>
                 <Trash2 size={13} />
               </button>
+              <button className="paint-text-box-done" type="button" aria-label="Done text box" title="Done text box" onClick={onFinishTextBox}>
+                <Check size={13} />
+              </button>
               <textarea
                 aria-label="Text box"
                 autoFocus
@@ -3341,6 +3579,12 @@ function PaintEditsLayer({
                 onKeyDown={(event) => {
                   const shortcutKey = event.key.toLowerCase();
                   if ((event.ctrlKey || event.metaKey) && (shortcutKey === "z" || shortcutKey === "s")) {
+                    return;
+                  }
+
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    onFinishTextBox();
                     return;
                   }
 

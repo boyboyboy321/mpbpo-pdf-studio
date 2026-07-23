@@ -1,4 +1,4 @@
-import type { SplitOutputMode } from "../domain/pdf";
+import type { SplitOutputMode, ThumbnailLayoutMode } from "../domain/pdf";
 import type { RenderQualityPreset, RenderQualitySettings } from "../domain/pdfSettings";
 import {
   clampRenderQualitySettings,
@@ -16,6 +16,7 @@ export interface EditorPreferences {
   renderQualityPreset: RenderQualityPreset;
   splitCustomOutputFolder: string | null;
   splitOutputMode: SplitOutputMode;
+  thumbnailLayout: ThumbnailLayoutMode;
   thumbnailScale: number;
 }
 
@@ -27,6 +28,7 @@ export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
   renderQualityPreset: DEFAULT_RENDER_QUALITY_PRESET,
   splitCustomOutputFolder: null,
   splitOutputMode: "siblingFolder",
+  thumbnailLayout: "grid",
   thumbnailScale: DEFAULT_THUMBNAIL_SCALE,
 };
 
@@ -58,6 +60,9 @@ export function loadEditorPreferences(): EditorPreferences {
           ? parsedValue.splitCustomOutputFolder
           : DEFAULT_EDITOR_PREFERENCES.splitCustomOutputFolder,
       splitOutputMode: isSplitOutputMode(parsedValue.splitOutputMode) ? parsedValue.splitOutputMode : DEFAULT_EDITOR_PREFERENCES.splitOutputMode,
+      thumbnailLayout: isThumbnailLayoutMode(parsedValue.thumbnailLayout)
+        ? parsedValue.thumbnailLayout
+        : DEFAULT_EDITOR_PREFERENCES.thumbnailLayout,
       thumbnailScale: typeof parsedValue.thumbnailScale === "number" ? clampThumbnailScale(parsedValue.thumbnailScale) : DEFAULT_EDITOR_PREFERENCES.thumbnailScale,
     };
   } catch {
@@ -79,6 +84,7 @@ export function saveEditorPreferences(preferences: EditorPreferences) {
         renderQualityPreset: preferences.renderQualityPreset,
         splitCustomOutputFolder: preferences.splitCustomOutputFolder,
         splitOutputMode: preferences.splitOutputMode,
+        thumbnailLayout: preferences.thumbnailLayout,
         thumbnailScale: clampThumbnailScale(preferences.thumbnailScale),
       }),
     );
@@ -115,4 +121,8 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 
 function isSplitOutputMode(value: unknown): value is SplitOutputMode {
   return value === "siblingFolder" || value === "originalFolderDeleteOriginal" || value === "customFolder";
+}
+
+function isThumbnailLayoutMode(value: unknown): value is ThumbnailLayoutMode {
+  return value === "grid" || value === "large1" || value === "large2" || value === "large3";
 }

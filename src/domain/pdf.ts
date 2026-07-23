@@ -69,6 +69,15 @@ export type PdfPagePaintEdit =
 export type PdfTextAlign = "left" | "center" | "right";
 
 export type SplitOutputMode = "siblingFolder" | "originalFolderDeleteOriginal" | "customFolder";
+export type ThumbnailLayoutMode = "grid" | "large1" | "large2" | "large3";
+
+export interface PdfDocumentUndoSnapshot {
+  cutBeforePages: number[];
+  focusPageNumber: number;
+  lastSelectedPageNumber: number;
+  pages: PdfPage[];
+  selectedPages: number[];
+}
 
 export interface PdfDocument {
   detailPanelVisible: boolean;
@@ -79,6 +88,7 @@ export interface PdfDocument {
   lastSelectedPageNumber: number;
   sizeBytes: number;
   pages: PdfPage[];
+  previewUndoStack: PdfDocumentUndoSnapshot[];
   selectedPages: Set<number>;
   cutBeforePages: Set<number>;
   hoverZoomEnabled: boolean;
@@ -86,6 +96,7 @@ export interface PdfDocument {
   renderQualityPreset: RenderQualityPreset;
   splitCustomOutputFolder: string | null;
   splitOutputMode: SplitOutputMode;
+  thumbnailLayout: ThumbnailLayoutMode;
   thumbnailScale: number;
 }
 

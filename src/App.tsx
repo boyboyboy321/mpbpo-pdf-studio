@@ -124,6 +124,15 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+
+    window.addEventListener("contextmenu", handleContextMenu, true);
+    return () => window.removeEventListener("contextmenu", handleContextMenu, true);
+  }, []);
+
+  useEffect(() => {
     if (!releaseChecksEnabled) {
       return;
     }
@@ -425,6 +434,7 @@ export function App() {
       renderQualityPreset: document.renderQualityPreset,
       splitCustomOutputFolder: document.splitCustomOutputFolder,
       splitOutputMode: document.splitOutputMode,
+      thumbnailLayout: document.thumbnailLayout,
       thumbnailScale: document.thumbnailScale,
     });
   }, [
@@ -433,6 +443,7 @@ export function App() {
     document?.renderQualityPreset,
     document?.splitCustomOutputFolder,
     document?.splitOutputMode,
+    document?.thumbnailLayout,
     document?.thumbnailScale,
   ]);
 
