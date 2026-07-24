@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "appId": "mpbpo-pdf-studio",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "minVersion": "0.0.0",
   "mandatoryUpdate": true,
   "blocked": false,
   "blockedVersions": [],
-  "message": "MpBPO PDF Studio 0.2.5 is active."
+  "message": "MpBPO PDF Studio 0.2.6 is active."
 }

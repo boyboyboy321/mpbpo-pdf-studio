@@ -128,6 +128,9 @@ interface FullPreviewState {
 }
 
 type DetailTool = "cover" | "crop" | "hand" | "straighten" | "text";
+interface FullPreviewPageChangeOptions {
+  scrollPreview?: boolean;
+}
 
 interface DraftCoverRect {
   height: number;
@@ -735,24 +738,37 @@ export function EditorView({
     setHovered(null);
   }, []);
 
-  const focusPreviewPage = useCallback(
+  const selectPreviewPage = useCallback(
     (pageNumber: number) => {
       const safePageNumber = Math.min(Math.max(1, pageNumber), document.pages.length);
       dispatch({ type: "select-page", pageNumber: safePageNumber, selectionMode: "single" });
-      setPageScrollTarget(safePageNumber);
+      return safePageNumber;
     },
     [dispatch, document.pages.length],
   );
 
+  const focusPreviewPage = useCallback(
+    (pageNumber: number) => {
+      const safePageNumber = selectPreviewPage(pageNumber);
+      setPageScrollTarget(safePageNumber);
+    },
+    [selectPreviewPage],
+  );
+
   const openFullPreviewPage = useCallback(
-    (pageNumber: number, initialTool: DetailTool = "hand") => {
+    (pageNumber: number, initialTool: DetailTool = "hand", options: FullPreviewPageChangeOptions = {}) => {
       const page = document.pages[pageNumber - 1];
 
       if (!page) {
         return;
       }
 
-      focusPreviewPage(pageNumber);
+      if (options.scrollPreview) {
+        focusPreviewPage(pageNumber);
+      } else {
+        selectPreviewPage(pageNumber);
+      }
+
       const preview = detailPreviewsRef.current[page.id] ?? null;
       setFullPreview({ initialTool, page, preview, status: preview ? "ready" : "loading" });
 
@@ -765,7 +781,7 @@ export function EditorView({
         requestDetailPreview(pageNumber);
       }
     },
-    [document.filePath, document.pages, focusPreviewPage, requestDetailPreview],
+    [document.filePath, document.pages, focusPreviewPage, requestDetailPreview, selectPreviewPage],
   );
 
   const handleOpenFullPreview = useCallback(
@@ -790,9 +806,9 @@ export function EditorView({
       }
 
       dispatch({ type: "toggle-cut", beforePage: pageNumber });
-      focusPreviewPage(pageNumber);
+      selectPreviewPage(pageNumber);
     },
-    [dispatch, focusPreviewPage],
+    [dispatch, selectPreviewPage],
   );
 
   const handleCloseFullPreview = useCallback(() => {
@@ -1279,7 +1295,7 @@ export function EditorView({
               state={resolvedFullPreview}
               onAddPaintEdit={handleAddPagePaintEdit}
               onClose={handleCloseFullPreview}
-              onPageChange={openFullPreviewPage}
+              onPageChange={(pageNumber, options) => openFullPreviewPage(pageNumber, "hand", options)}
               onRemovePaintEdit={handleRemovePagePaintEdit}
               onRotateClockwise={handleRotateFullPreview}
               onToggleCutBeforePage={handleToggleCutBeforePage}
@@ -2281,7 +2297,7 @@ function FullPreviewOverlay({
   pageCount: number;
   state: FullPreviewState;
   onClose: () => void;
-  onPageChange: (pageNumber: number) => void;
+  onPageChange: (pageNumber: number, options?: FullPreviewPageChangeOptions) => void;
   onRemovePaintEdit: (pageNumber: number, editId: string) => void;
   onRotateClockwise: (pageNumber: number) => void;
   onToggleCutBeforePage: (pageNumber: number) => void;
@@ -2556,7 +2572,7 @@ function FullPreviewOverlay({
     setPageInput(String(nextPage));
 
     if (nextPage !== state.page.pageNumber) {
-      goToPage(nextPage);
+      goToPage(nextPage, { scrollPreview: true });
     }
   }
 
@@ -2690,10 +2706,10 @@ function FullPreviewOverlay({
     commitStraightenInput();
   }
 
-  function goToPage(pageNumber: number) {
+  function goToPage(pageNumber: number, options: FullPreviewPageChangeOptions = {}) {
     discardActiveEmptyTextEdit();
     setActiveTextEditId(null);
-    onPageChange(pageNumber);
+    onPageChange(pageNumber, options);
   }
 
   function getVisualPointFromClient(clientX: number, clientY: number): NormalizedPoint | null {
