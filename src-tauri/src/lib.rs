@@ -2354,6 +2354,7 @@ fn paint_edits_content(
                 let (visual_right, visual_up) = visual_text_basis(page_box, source_rotation);
 
                 content.push_str("q\nBT\n");
+                append_pdf_text_state_reset(&mut content, line_height);
                 content.push_str(&format!(
                     "/{} {} Tf\n{} {} {} rg\n",
                     font.resource_key.as_str(),
@@ -2407,12 +2408,16 @@ fn paint_edits_content(
                             underline_y,
                         );
                         content.push_str(&format!(
-                            "ET\n{} {} m\n{} {} l\n{} w\nS\nBT\n/{} {} Tf\n{} {} {} rg\n",
+                            "ET\n{} {} m\n{} {} l\n{} w\nS\nBT\n",
                             pdf_float(underline_start.x),
                             pdf_float(underline_start.y),
                             pdf_float(underline_end.x),
                             pdf_float(underline_end.y),
-                            pdf_float((font_size / 14.0).clamp(0.6, 2.0)),
+                            pdf_float((font_size / 14.0).clamp(0.6, 2.0))
+                        ));
+                        append_pdf_text_state_reset(&mut content, line_height);
+                        content.push_str(&format!(
+                            "/{} {} Tf\n{} {} {} rg\n",
                             font.resource_key.as_str(),
                             pdf_float(font_size),
                             pdf_float(r),
@@ -2626,6 +2631,11 @@ fn pdf_text_font_size(visual_font_size: f64, visual_page_height: f64) -> f64 {
     let visual_font_size = visual_font_size.clamp(6.0, 96.0);
     let scale = (visual_page_height / 842.0).clamp(0.45, 8.0);
     (visual_font_size * scale).clamp(4.0, 360.0)
+}
+
+fn append_pdf_text_state_reset(content: &mut String, line_height: f64) {
+    content.push_str("0 Tr\n100 Tz\n0 Tc\n0 Tw\n0 Ts\n");
+    let _ = writeln!(content, "{} TL", pdf_float(line_height));
 }
 
 fn default_text_align() -> String {
@@ -3791,6 +3801,7 @@ mod tests {
             0,
         );
 
+        assert!(content.contains("0 Tr\n100 Tz\n0 Tc\n0 Tw\n0 Ts\n31.2 TL"));
         assert!(content.contains("/SPFTest 26 Tf"));
         assert!(content.contains("<00020003> Tj"));
     }
@@ -3839,6 +3850,7 @@ mod tests {
         );
 
         assert!(content.contains("0 1 -1 0"));
+        assert!(content.contains("0 Tr\n100 Tz\n0 Tc\n0 Tw\n0 Ts\n"));
         assert!(content.contains("<0001> Tj"));
         assert!(content.contains(" m\n"));
         assert!(content.contains(" l\n"));

@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "splitpdf_studio"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "chrono",
  "image",
