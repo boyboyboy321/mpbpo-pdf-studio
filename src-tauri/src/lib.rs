@@ -39,6 +39,8 @@ const APP_POLICY_URLS: [&str; 2] = [
     "https://raw.githubusercontent.com/boyboyboy321/mpbpo-pdf-studio/main/app-policy.json",
     "https://github.com/boyboyboy321/mpbpo-pdf-studio/releases/latest/download/app-policy.json",
 ];
+const PDF_APP_NAME: &str = "MpBPO PDF Studio";
+const PDF_APP_SUBJECT: &str = "PDF processed with MpBPO PDF Studio";
 const PAGE_INHERITABLE_KEYS: [&[u8]; 8] = [
     b"Resources",
     b"MediaBox",
@@ -1817,6 +1819,7 @@ fn write_page_range(
     );
     output_document.trailer.set("Root", catalog_id);
     set_split_trailer_id(source_document, &mut output_document, output_path, range);
+    stamp_pdf_metadata(&mut output_document, Some(source_document))?;
     output_document.save(output_path)?;
     Ok(())
 }
@@ -1948,6 +1951,8 @@ fn write_edited_pdf(
             end: pages.len() as u32,
         },
     );
+    let metadata_source = source_documents.values().next();
+    stamp_pdf_metadata(&mut output_document, metadata_source)?;
     output_document.save(output_path)?;
     Ok(())
 }
@@ -3511,6 +3516,85 @@ fn pdf_file_id(id: [u8; 16]) -> Object {
     Object::String(id.to_vec(), StringFormat::Hexadecimal)
 }
 
+fn stamp_pdf_metadata(
+    output_document: &mut LopdfDocument,
+    source_document: Option<&LopdfDocument>,
+) -> Result<(), AppError> {
+    let source_info = source_document.and_then(pdf_info_dictionary);
+    let now = pdf_date_now();
+
+    let mut info = Dictionary::new();
+    info.set(
+        "Author",
+        pdf_info_string_or(source_info, b"Author", PDF_APP_NAME),
+    );
+    info.set(
+        "Subject",
+        pdf_info_string_or(source_info, b"Subject", PDF_APP_SUBJECT),
+    );
+    if let Some(keywords) = pdf_info_string(source_info, b"Keywords") {
+        info.set("Keywords", keywords);
+    }
+    info.set("Creator", Object::string_literal(PDF_APP_NAME));
+    info.set("Producer", Object::string_literal(PDF_APP_NAME));
+    info.set("CreationDate", Object::string_literal(now.clone()));
+    info.set("ModDate", Object::string_literal(now));
+
+    let info_id = output_document.new_object_id();
+    output_document
+        .objects
+        .insert(info_id, Object::Dictionary(info));
+    output_document.trailer.set("Info", info_id);
+    Ok(())
+}
+
+fn pdf_info_dictionary(document: &LopdfDocument) -> Option<&Dictionary> {
+    match document.trailer.get(b"Info").ok()? {
+        Object::Dictionary(dictionary) => Some(dictionary),
+        Object::Reference(id) => match document.objects.get(id)? {
+            Object::Dictionary(dictionary) => Some(dictionary),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn pdf_info_string_or(
+    source_info: Option<&Dictionary>,
+    key: &[u8],
+    fallback: impl Into<String>,
+) -> Object {
+    pdf_info_string(source_info, key).unwrap_or_else(|| Object::string_literal(fallback.into()))
+}
+
+fn pdf_info_string(source_info: Option<&Dictionary>, key: &[u8]) -> Option<Object> {
+    source_info
+        .and_then(|dictionary| dictionary.get(key).ok())
+        .and_then(|value| match value {
+            Object::String(bytes, format) if !bytes.is_empty() => {
+                Some(Object::String(bytes.clone(), *format))
+            }
+            _ => None,
+        })
+}
+
+fn pdf_date_now() -> String {
+    let now = Local::now();
+    let offset_seconds = now.offset().local_minus_utc();
+    let sign = if offset_seconds >= 0 { '+' } else { '-' };
+    let offset_minutes = offset_seconds.abs() / 60;
+    let offset_hours = offset_minutes / 60;
+    let offset_remainder_minutes = offset_minutes % 60;
+
+    format!(
+        "D:{}{}{:02}'{:02}'",
+        now.format("%Y%m%d%H%M%S"),
+        sign,
+        offset_hours,
+        offset_remainder_minutes
+    )
+}
+
 fn write_page_range_by_deletion(
     source_document: &LopdfDocument,
     source_path: &Path,
@@ -3531,6 +3615,7 @@ fn write_page_range_by_deletion(
     }
 
     set_split_trailer_id(source_document, &mut document, output_path, range);
+    stamp_pdf_metadata(&mut document, Some(source_document))?;
     document.save(output_path)?;
     Ok(())
 }
@@ -3961,6 +4046,19 @@ mod tests {
             first_output.trailer.get(b"ID"),
             Ok(Object::Array(ids)) if ids.len() == 2
         ));
+        assert_eq!(
+            pdf_info_text(&first_output, b"Producer").as_deref(),
+            Some(PDF_APP_NAME)
+        );
+        assert_eq!(
+            pdf_info_text(&first_output, b"Creator").as_deref(),
+            Some(PDF_APP_NAME)
+        );
+        assert!(pdf_info_text(&first_output, b"CreationDate")
+            .expect("split output creation date")
+            .starts_with("D:"));
+        assert!(pdf_info_text(&first_output, b"Title").is_none());
+        assert!(pdf_info_text(&first_output, b"Keywords").is_none());
 
         let output_dir = PathBuf::from(&result.output_dir);
         assert_eq!(output_dir.parent(), Some(work_dir.as_path()));
@@ -4059,6 +4157,15 @@ mod tests {
                 .expect("saved page rotate"),
             90
         );
+        assert_eq!(
+            pdf_info_text(&saved_document, b"Producer").as_deref(),
+            Some(PDF_APP_NAME)
+        );
+        assert_eq!(
+            pdf_info_text(&saved_document, b"Creator").as_deref(),
+            Some(PDF_APP_NAME)
+        );
+        assert!(pdf_info_text(&saved_document, b"Title").is_none());
 
         let _ = fs::remove_dir_all(&work_dir);
     }
@@ -4273,5 +4380,11 @@ mod tests {
         }
 
         filters
+    }
+
+    fn pdf_info_text(document: &LopdfDocument, key: &[u8]) -> Option<String> {
+        let info = super::pdf_info_dictionary(document)?;
+        let bytes = info.get(key).ok()?.as_str().ok()?;
+        Some(String::from_utf8_lossy(bytes).to_string())
     }
 }
