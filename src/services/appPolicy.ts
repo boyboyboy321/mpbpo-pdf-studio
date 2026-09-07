@@ -12,7 +12,7 @@ export type AppPolicy = {
   version?: string;
 };
 
-export const APP_VERSION = "0.2.6";
+export const APP_VERSION = "0.2.9";
 
 const APP_POLICY_URLS = [
   "https://raw.githubusercontent.com/boyboyboy321/mpbpo-pdf-studio/main/app-policy.json",

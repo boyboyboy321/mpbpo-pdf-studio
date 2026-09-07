@@ -37,6 +37,9 @@ jobs:
       - name: Install updater signer
         run: cargo install rsign2 --locked
 
+      - name: Prepare tested WebView2 runtime
+        run: node scripts/prepare-webview2.mjs
+
       - name: Build signed NSIS installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

@@ -165,7 +165,7 @@ type CropResizeHandle = "east" | "move" | "north" | "northEast" | "northWest" | 
 
 type EyeDropperWindow = Window & {
   EyeDropper?: new () => {
-    open: () => Promise<{ sRGBHex: string }>;
+    open: (options: { signal: AbortSignal }) => Promise<{ sRGBHex: string }>;
   };
 };
 
@@ -2310,6 +2310,9 @@ function FullPreviewOverlay({
   const [pageInput, setPageInput] = useState(currentPageText);
   const [tool, setTool] = useState<DetailTool>(state.initialTool ?? "hand");
   const [coverColor, setCoverColor] = useState("#ffffff");
+  const [isPickingColor, setIsPickingColor] = useState(false);
+  const [colorPickerError, setColorPickerError] = useState<string | null>(null);
+  const colorPickerAbortRef = useRef<AbortController | null>(null);
   const [textStyle, setTextStyle] = useState<DetailTextStyle>({
     bold: false,
     color: "#111827",
@@ -2408,6 +2411,15 @@ function FullPreviewOverlay({
   const straightenScale = getStraightenScale(straightenDegrees, displayRatioValue);
 
   useEffect(() => {
+    setIsPickingColor(false);
+    setColorPickerError(null);
+    return () => {
+      colorPickerAbortRef.current?.abort();
+      colorPickerAbortRef.current = null;
+    };
+  }, [state.page.id]);
+
+  useEffect(() => {
     setPageInput(currentPageText);
   }, [currentPageText]);
 
@@ -2449,6 +2461,13 @@ function FullPreviewOverlay({
 
   useEffect(() => {
     const handlePreviewKeyDown = (event: KeyboardEvent) => {
+      if (colorPickerAbortRef.current) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          colorPickerAbortRef.current.abort();
+        }
+        return;
+      }
       const key = event.key.toLowerCase();
       const isTyping = isTypingTarget(event.target);
 
@@ -3025,21 +3044,43 @@ function FullPreviewOverlay({
   }
 
   async function handlePickCoverColor() {
+    if (colorPickerAbortRef.current) return;
     const EyeDropper = (window as EyeDropperWindow).EyeDropper;
     if (!EyeDropper) {
+      setColorPickerError("EyeDropper is unavailable in this WebView2 runtime.");
       return;
     }
 
+    const controller = new AbortController();
+    colorPickerAbortRef.current = controller;
+    setColorPickerError(null);
+    setIsPickingColor(true);
+    const startedAt = performance.now();
     try {
-      const result = await new EyeDropper().open();
-      if (result.sRGBHex) {
+      // Keep open() in the original click/key event to retain user activation.
+      const result = await new EyeDropper().open({ signal: controller.signal });
+      if (!controller.signal.aborted && result.sRGBHex) {
         setCustomCoverColor(result.sRGBHex);
+        setTool("cover");
       }
-    } catch {
-      // Canceling the native picker with Esc is normal.
+    } catch (error: unknown) {
+      if (controller.signal.aborted) return;
+      const isAbort = error instanceof DOMException && error.name === "AbortError";
+      // WebView2 can report AbortError before it has even shown the picker.
+      if (!isAbort || performance.now() - startedAt < 250) {
+        const runtime = navigator.userAgent.match(/Edg\/([\d.]+)/)?.[1] ?? "unknown";
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn("EyeDropper failed to open", { runtime, detail });
+        setColorPickerError(isAbort
+          ? `WebView2 ${runtime} closed the color picker immediately. No color was changed. Use the tested WebView2 runtime for this app.`
+          : `Could not open EyeDropper: ${detail}`);
+      }
+    } finally {
+      if (colorPickerAbortRef.current === controller) {
+        colorPickerAbortRef.current = null;
+        setIsPickingColor(false);
+      }
     }
-
-    setTool("cover");
   }
 
   function handleMoveTextBoxStart(event: ReactPointerEvent<HTMLButtonElement>, edit: Extract<PdfPagePaintEdit, { type: "text" }>) {
@@ -3157,6 +3198,8 @@ function FullPreviewOverlay({
         type="button"
         aria-label="Pick color from screen"
         title="Pick color (P)"
+        disabled={isPickingColor}
+        aria-pressed={isPickingColor}
         onClick={() => void handlePickCoverColor()}
       >
         <Pipette size={18} />
@@ -3269,6 +3312,13 @@ function FullPreviewOverlay({
 
   return (
     <div className="full-preview-overlay" role="dialog" aria-modal="true" aria-label={`Page ${state.page.pageNumber} preview`} onMouseDown={closePreview}>
+      {colorPickerError ? (
+        <aside className="split-toast is-error color-picker-error" role="alert" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="split-toast-rail" />
+          <div className="split-toast-body"><strong>Pick color</strong><span>{colorPickerError}</span></div>
+          <button className="split-toast-close" type="button" aria-label="Dismiss color picker error" title="Dismiss" onClick={() => setColorPickerError(null)}><X size={18} /></button>
+        </aside>
+      ) : null}
       <div className="full-preview-stage">
         {tool === "text" ? (
           <div

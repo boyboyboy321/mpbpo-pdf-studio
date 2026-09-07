@@ -8,4 +8,7 @@ if exist "%VSVARS%" (
 
 set "PATH=%ProgramFiles%\nodejs;%USERPROFILE%\.cargo\bin;%PATH%"
 cd /d "%~dp0.."
+node scripts\prepare-webview2.mjs --check
+if errorlevel 1 exit /b 1
+if /i "%~1"=="--check" exit /b 0
 pnpm.cmd desktop

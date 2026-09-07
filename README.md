@@ -24,7 +24,10 @@ Open http://127.0.0.1:5173 after the dev server starts.
 Install Node.js and Rust/Cargo first, then run:
 
 ```powershell
+node scripts/prepare-webview2.mjs
 pnpm desktop
 ```
+
+For the prepared local workspace, use `Chay-Online-Test.bat`. See [WEBVIEW2.md](WEBVIEW2.md) for the bundled Microsoft runtime, offline operation, and runtime security updates.
 
 The `src-tauri` shell is already present. It includes the Tauri v2 config, a main window, base capabilities, and one sample IPC command so the PDF backend can be connected cleanly. During desktop development, Tauri reuses the existing Vite server on port `5173` when it is already running.

@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const outputDir = resolve("dist-release");
@@ -41,7 +41,7 @@ async function findNewestInstaller() {
     }
 
     for (const entry of entries) {
-      if (!entry.toLowerCase().endsWith(".exe")) {
+      if (!entry.endsWith("-setup.exe") || !entry.includes(`_${appConfig.version}_`)) {
         continue;
       }
 
@@ -120,6 +120,9 @@ try {
   process.exitCode = 1;
 } finally {
   if (tempDir) {
+    if (dirname(resolve(tempDir)) !== resolve(tmpdir()) || !basename(tempDir).startsWith("mpbpo-updater-sign-")) {
+      throw new Error("Refusing to remove an unexpected signing directory.");
+    }
     await rm(tempDir, { recursive: true, force: true });
   }
 }

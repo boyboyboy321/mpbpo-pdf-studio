@@ -1,7 +1,6 @@
 import {
   DndContext,
   DragOverlay,
-  PointerSensor,
   pointerWithin,
   useDraggable,
   useDroppable,
@@ -33,6 +32,7 @@ import { getFriendlyLoadError, renderDocumentPages } from "../services/pdfLoader
 import type { DocumentAction } from "../state/documentReducer";
 
 import { MockPaper } from "./EditorView";
+import { PagePointerSensor } from "./PagePointerSensor";
 
 type PreviewEntry =
   | { status: "loading" }
@@ -109,7 +109,7 @@ export const PageGrid = memo(function PageGrid({
   const [previewVersion, setPreviewVersion] = useState(0);
   const isDraggingPages = dragState !== null;
   const sensors = useSensors(
-    useSensor(PointerSensor, {
+    useSensor(PagePointerSensor, {
       activationConstraint: {
         distance: 7,
       },
@@ -167,6 +167,10 @@ export const PageGrid = memo(function PageGrid({
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      if ((event.buttons & 1) === 0) {
+        dragPointerYRef.current = null;
+        return;
+      }
       dragPointerYRef.current = event.clientY;
       scheduleAutoScroll();
     };
@@ -514,6 +518,7 @@ export const PageGrid = memo(function PageGrid({
 
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
+      dragPointerYRef.current = null;
       const draggedPageNumber = dragState?.draggedPageNumber ?? getPageNumberFromDragData(event.active.data.current);
       const dropBeforePageNumber = getDropBeforePageNumber(event, document.pages.length) ?? dragState?.dropBeforePageNumber ?? null;
 
@@ -529,12 +534,14 @@ export const PageGrid = memo(function PageGrid({
   );
 
   const handleDragCancel = useCallback(() => {
+    dragPointerYRef.current = null;
     setDragState(null);
     onHoverEnd();
   }, [onHoverEnd]);
 
   return (
     <DndContext
+      autoScroll={false}
       collisionDetection={pointerWithin}
       modifiers={[restrictToWindowEdges]}
       sensors={sensors}

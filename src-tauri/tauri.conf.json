@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MpBPO PDF Studio",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "identifier": "com.splitpdf.studio",
   "build": {
     "beforeDevCommand": "node ./scripts/ensure-vite-dev.mjs",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "node scripts/prepare-webview2.mjs --check && pnpm build",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },
@@ -41,6 +41,10 @@
       "nsis"
     ],
     "createUpdaterArtifacts": false,
+    "windows": {
+      "webviewInstallMode": { "type": "fixedRuntime", "path": "resources/webview2" },
+      "nsis": { "installerHooks": "windows/installer-hooks.nsh" }
+    },
     "fileAssociations": [
       {
         "ext": [

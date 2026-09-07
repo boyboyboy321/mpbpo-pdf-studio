@@ -1,8 +1,8 @@
-import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { copyFile, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 const [, , repositoryArg] = process.argv;
-const repository = repositoryArg || process.env.GITHUB_REPOSITORY || "buiqu/mpbpo-pdf-studio";
+const repository = repositoryArg || process.env.GITHUB_REPOSITORY || "boyboyboy321/mpbpo-pdf-studio";
 
 if (!/^[\w.-]+\/[\w.-]+$/.test(repository)) {
   console.error("Usage: node scripts/create-github-release-json.mjs owner/repo");
@@ -34,7 +34,7 @@ async function findNewestInstaller() {
     }
 
     for (const entry of entries) {
-      if (!entry.toLowerCase().endsWith(".exe")) {
+      if (!entry.endsWith("-setup.exe") || !entry.includes(`_${version}_`)) {
         continue;
       }
 
@@ -67,6 +67,14 @@ try {
   process.exit(1);
 }
 
+if (dirname(outputDir) !== resolve(import.meta.dirname, "..") || basename(outputDir) !== "dist-release") {
+  throw new Error("Refusing to clear a release directory outside this workspace.");
+}
+const outputMetadata = await lstat(outputDir).catch((error) => {
+  if (error.code !== "ENOENT") throw error;
+  return null;
+});
+if (outputMetadata?.isSymbolicLink()) throw new Error("Release output must not be a symbolic link.");
 await rm(outputDir, { force: true, recursive: true });
 await mkdir(outputDir, { recursive: true });
 

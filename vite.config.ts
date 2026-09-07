@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     watch: {
-      ignored: ["**/src-tauri/target/**"],
+      ignored: ["**/src-tauri/target/**", "**/src-tauri/resources/**", "**/.codex/**"],
     },
   },
 });
