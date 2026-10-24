@@ -75,4 +75,5 @@ export function createDocument(input: { filePath: string | null; fileName: strin
 export const tools: ToolItem[] = [
   { id: "split", label: "Split PDF", tone: "blue" },
   { id: "edit", label: "Edit PDF", tone: "green" },
+  { id: "merge", label: "Merge PDF", tone: "blue" },
 ];

@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EditorView } from "./components/EditorView";
 import { HomeView } from "./components/HomeView";
+import { MergeDialog } from "./components/MergeDialog";
 import type { PdfDocument, PdfLoadState } from "./domain/pdf";
 import { APP_VERSION, getPolicyBlockMessage, loadAppPolicy } from "./services/appPolicy";
 import { saveEditorPreferences } from "./services/editorPreferences";
@@ -49,7 +50,7 @@ type AppAccessState =
   | { status: "ready" }
   | { status: "locked"; message: string; reason: "connection" | "policy"; title: string };
 
-type FileWriteJobKind = "save" | "split";
+type FileWriteJobKind = "save" | "split" | "insert" | "merge";
 
 interface FileWriteJob {
   fileName: string;
@@ -95,6 +96,9 @@ export function App() {
   const [pendingTabClose, setPendingTabClose] = useState<PendingTabClose | null>(null);
   const [appCloseConfirmationOpen, setAppCloseConfirmationOpen] = useState(false);
   const [fileWriteJob, setFileWriteJob] = useState<FileWriteJob | null>(null);
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const mergeOpenRef = useRef(false);
+  const [mergeDrop, setMergeDrop] = useState<{ id: string; paths: string[] } | null>(null);
   const [loadState, setLoadState] = useState<PdfLoadState>({ status: "idle" });
   const [isFileDragging, setIsFileDragging] = useState(false);
   const [recentFiles, setRecentFiles] = useState(loadRecentFiles);
@@ -111,6 +115,7 @@ export function App() {
       if (event.key !== "Tab") {
         return;
       }
+      if (event.target instanceof Element && event.target.closest("[data-merge-dialog]")) return;
 
       event.preventDefault();
 
@@ -329,7 +334,7 @@ export function App() {
       if (fileWriteJob?.tabId === tabId) {
         setLoadState({
           status: "error",
-          message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before closing it.`,
+          message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "merge" ? "merging" : fileWriteJob.kind === "insert" ? "inserting pages" : fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before closing it.`,
         });
         return;
       }
@@ -368,7 +373,7 @@ export function App() {
       if (fileWriteJob) {
         setLoadState({
           status: "error",
-          message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before saving another file.`,
+          message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "merge" ? "merging" : fileWriteJob.kind === "insert" ? "inserting pages" : fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before saving another file.`,
         });
         return false;
       }
@@ -449,6 +454,10 @@ export function App() {
 
   const openPdfPaths = useCallback(
     async (paths: string[]) => {
+      if (fileWriteJob?.kind === "insert" || fileWriteJob?.kind === "merge") {
+        setLoadState({ status: "error", message: "A PDF operation is running. Please wait before opening another document." });
+        return;
+      }
       if (appAccessState.status !== "ready") {
         return;
       }
@@ -498,7 +507,7 @@ export function App() {
         setLoadState({ status: "error", message: getFriendlyLoadError(error) });
       }
     },
-    [activeTabId, appAccessState.status, tabs],
+    [activeTabId, appAccessState.status, fileWriteJob, tabs],
   );
 
   const openPdfPath = useCallback(
@@ -603,6 +612,11 @@ export function App() {
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         const { payload } = event;
+        if (mergeOpenRef.current) {
+          setIsFileDragging(false);
+          if (payload.type === "drop") setMergeDrop({ id: crypto.randomUUID(), paths: payload.paths });
+          return;
+        }
 
         if (payload.type === "enter" || payload.type === "over") {
           setIsFileDragging(true);
@@ -645,7 +659,7 @@ export function App() {
     if (fileWriteJob) {
       setLoadState({
         status: "error",
-        message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before closing the app.`,
+        message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "merge" ? "merging" : fileWriteJob.kind === "insert" ? "inserting pages" : fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before closing the app.`,
       });
       return;
     }
@@ -667,7 +681,7 @@ export function App() {
     if (fileWriteJob) {
       setLoadState({
         status: "error",
-        message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before saving changes.`,
+        message: `${fileWriteJob.fileName} is ${fileWriteJob.kind === "merge" ? "merging" : fileWriteJob.kind === "insert" ? "inserting pages" : fileWriteJob.kind === "split" ? "splitting" : "saving"}. Please wait before saving changes.`,
       });
       return;
     }
@@ -724,6 +738,7 @@ export function App() {
     <div className="desktop-frame">
       <AppTitleBar onRequestClose={requestCloseApp} />
       <DocumentTabBar
+        navigationDisabled={fileWriteJob?.kind === "insert"}
         activeTabId={activeTabId}
         tabs={tabs}
         onActivateHome={() => setActiveTabId(null)}
@@ -750,12 +765,21 @@ export function App() {
           loadState={loadState}
           recentFiles={recentFiles}
           onOpenDemo={openDemo}
+          onMerge={() => { mergeOpenRef.current = true; setMergeDrop(null); setMergeOpen(true); }}
           onOpenRecent={openRecentPdf}
           onPickPdf={pickAndOpenPdf}
         />
       )}
       <UpdateToast state={updateState} onClose={() => setUpdateState({ status: "idle" })} onInstall={installUpdate} onSkip={dismissUpdate} />
       <AppAccessGate accessState={appAccessState} updateState={updateState} onInstall={installUpdate} />
+      {mergeOpen ? <MergeDialog
+        busy={Boolean(fileWriteJob)}
+        dropRequest={mergeDrop}
+        onBeginBusyJob={beginFileWriteJob}
+        onEndBusyJob={endFileWriteJob}
+        onClose={() => { mergeOpenRef.current = false; setMergeOpen(false); }}
+        onOpenPdf={path => void openPdfPaths([path])}
+      /> : null}
       {pendingTabClose ? (
         <TabCloseConfirmDialog
           fileName={tabs.find((tab) => tab.id === pendingTabClose.tabId)?.document.fileName ?? "this PDF"}
@@ -780,6 +804,7 @@ export function App() {
 
 function DocumentTabBar({
   activeTabId,
+  navigationDisabled = false,
   onActivateHome,
   onActivateTab,
   onCloseTab,
@@ -787,6 +812,7 @@ function DocumentTabBar({
   tabs,
 }: {
   activeTabId: string | null;
+  navigationDisabled?: boolean;
   onActivateHome: () => void;
   onActivateTab: (tabId: string) => void;
   onCloseTab: (tabId: string) => void;
@@ -795,7 +821,7 @@ function DocumentTabBar({
 }) {
   return (
     <nav className="document-tabbar" aria-label="Open documents">
-      <button className={`document-tab is-home ${activeTabId ? "" : "is-active"}`} type="button" onClick={onActivateHome}>
+      <button className={`document-tab is-home ${activeTabId ? "" : "is-active"}`} type="button" disabled={navigationDisabled} onClick={onActivateHome}>
         <Home size={18} />
         Home
       </button>
@@ -804,6 +830,7 @@ function DocumentTabBar({
           className={`document-tab ${tab.id === activeTabId ? "is-active" : ""} ${tab.document.isDirty ? "is-dirty" : ""}`}
           type="button"
           key={tab.id}
+          disabled={navigationDisabled}
           title={tab.document.filePath ?? tab.document.fileName}
           onClick={() => onActivateTab(tab.id)}
         >
@@ -824,7 +851,7 @@ function DocumentTabBar({
           </span>
         </button>
       ))}
-      <button className="document-tab-add" type="button" onClick={onOpenPdf} aria-label="Open PDF">
+      <button className="document-tab-add" type="button" disabled={navigationDisabled} onClick={onOpenPdf} aria-label="Open PDF">
         <Plus size={18} />
       </button>
     </nav>

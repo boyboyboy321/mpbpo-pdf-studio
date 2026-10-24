@@ -22,6 +22,9 @@ use tauri::{Emitter, Manager, State};
 use thiserror::Error;
 use ttf_parser::Face;
 
+mod insert;
+mod merge;
+
 const THUMBNAIL_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const THUMBNAIL_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const THUMBNAIL_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
@@ -352,6 +355,7 @@ struct PdfRenderWorker {
 
 enum RenderCommand {
     Render(RenderJob),
+    Insert(Box<dyn FnOnce(Result<&Pdfium, &str>) + Send>),
     Release { response: mpsc::Sender<()> },
 }
 
@@ -969,61 +973,49 @@ fn open_folder_impl(path: &Path) -> Result<(), AppError> {
 }
 
 #[tauri::command]
-async fn read_insert_pages(paths: Vec<String>) -> Result<Vec<InsertPageMetadata>, AppError> {
-    tauri::async_runtime::spawn_blocking(move || read_insert_pages_impl(paths))
-        .await
-        .map_err(|error| AppError::State(format!("Read insert file task failed: {error}")))?
-}
-
-fn read_insert_pages_impl(paths: Vec<String>) -> Result<Vec<InsertPageMetadata>, AppError> {
-    let mut pages = Vec::new();
-
-    for path in paths {
-        let file_path = Path::new(&path);
-        if !file_path.exists() {
-            return Err(AppError::NotFound(path));
-        }
-
-        let file_name = file_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("insert")
-            .to_string();
-
-        if is_pdf(file_path) {
-            let page_count = read_page_count(file_path)?;
-            for page_number in 1..=page_count {
-                pages.push(InsertPageMetadata {
-                    source: PageSource::Pdf {
-                        file_name: file_name.clone(),
-                        file_path: file_path.to_string_lossy().to_string(),
-                        page_number,
+async fn read_insert_pages(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    run_id: String,
+) -> Result<insert::InsertBatchResult, AppError> {
+    let staging_root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| AppError::State(error.to_string()))?
+        .join("insert-sources");
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>().inner.clone();
+        let (response, result) = mpsc::channel();
+        state
+            .renderer
+            .sender
+            .lock()
+            .map_err(|_| AppError::State("PDF render worker lock was poisoned".into()))?
+            .send(RenderCommand::Insert(Box::new(move |pdfium| {
+                let batch = insert::read_insert_pages_impl(
+                    paths,
+                    run_id,
+                    &staging_root,
+                    |progress| {
+                        let _ = app.emit("insert-progress", progress);
                     },
-                });
-            }
-            continue;
-        }
-
-        if is_supported_image(file_path) {
-            let (width, height) = image_dimensions(file_path)
-                .map_err(|error| AppError::Preview(error.to_string()))?;
-            pages.push(InsertPageMetadata {
-                source: PageSource::Image {
-                    file_name,
-                    file_path: file_path.to_string_lossy().to_string(),
-                    width,
-                    height,
-                },
-            });
-            continue;
-        }
-
-        return Err(AppError::UnsupportedInsertFile(
-            file_path.to_string_lossy().to_string(),
-        ));
-    }
-
-    Ok(pages)
+                    |path| {
+                        app.asset_protocol_scope()
+                            .allow_file(path)
+                            .map_err(|error| error.to_string())
+                    },
+                    |directory| app.state::<insert::InsertSourceStore>().retain(directory),
+                    pdfium,
+                );
+                let _ = response.send(batch);
+            })))
+            .map_err(|_| AppError::State("PDF render worker stopped".into()))?;
+        result
+            .recv()
+            .map_err(|_| AppError::State("Insert worker did not return a result".into()))?
+    })
+    .await
+    .map_err(|error| AppError::State(format!("Read insert file task failed: {error}")))?
 }
 
 #[tauri::command]
@@ -1152,6 +1144,7 @@ fn render_worker_loop(receiver: mpsc::Receiver<RenderCommand>) {
             let message = format!("Could not prepare PDF renderer: {error}");
             for command in receiver {
                 match command {
+                    RenderCommand::Insert(run) => run(Err(&message)),
                     RenderCommand::Render(job) => {
                         let _ = job.response.send(Err(message.clone()));
                     }
@@ -1168,6 +1161,16 @@ fn render_worker_loop(receiver: mpsc::Receiver<RenderCommand>) {
 
     loop {
         match receiver.recv_timeout(PDF_RENDER_SESSION_IDLE_TTL) {
+            Ok(RenderCommand::Insert(run)) => {
+                {
+                    let _lock = PDFIUM_RENDER_LOCK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    drop(current_session.take());
+                }
+                trim_process_working_set();
+                run(Ok(&pdfium));
+            }
             Ok(RenderCommand::Render(job)) => {
                 respond_to_render_job(&pdfium, &mut current_session, job);
             }
@@ -1778,12 +1781,114 @@ fn unique_output_path(output_dir: &Path, file_name: &str) -> PathBuf {
     unreachable!("infinite suffix search should always find a writable file name")
 }
 
+fn parse_pdf_version(bytes: &[u8]) -> Result<(u8, u8), AppError> {
+    match bytes {
+        [major @ b'1'..=b'9', b'.', minor @ b'0'..=b'9'] => Ok((major - b'0', minor - b'0')),
+        _ => Err(AppError::SplitValidation(format!(
+            "Invalid PDF version declaration: {}",
+            String::from_utf8_lossy(bytes)
+        ))),
+    }
+}
+
+fn require_pdf_version(document: &mut LopdfDocument, minimum: (u8, u8)) -> Result<(), AppError> {
+    let version = parse_pdf_version(document.version.as_bytes())?.max(minimum);
+    document.version = format!("{}.{}", version.0, version.1);
+    Ok(())
+}
+
+fn output_pdf_version<'a>(
+    documents: impl IntoIterator<Item = &'a LopdfDocument>,
+) -> Result<String, AppError> {
+    let mut version = (1, 0);
+    for document in documents {
+        version = version.max(parse_pdf_version(document.version.as_bytes())?);
+        if let Ok(value) = document.catalog()?.get(b"Version") {
+            let (_, value) = document.dereference(value)?;
+            if !matches!(value, Object::Null) {
+                version = version.max(parse_pdf_version(value.as_name()?)?);
+            }
+        }
+    }
+    Ok(format!("{}.{}", version.0, version.1))
+}
+
+fn prepare_pdf_output(document: &mut LopdfDocument) -> Result<(), AppError> {
+    // Inspect object dictionaries only, never decode image/content streams.
+    // Source declarations cover features not generated by our own writers.
+    let mut required = (1, 0);
+    let mut pending: Vec<_> = document.objects.values().collect();
+    while let Some(object) = pending.pop() {
+        let dictionary = match object {
+            Object::Array(values) => {
+                if values.first().and_then(|value| value.as_name().ok()) == Some(b"ICCBased") {
+                    required = required.max((1, 3));
+                }
+                pending.extend(values);
+                continue;
+            }
+            Object::Dictionary(dictionary) => dictionary,
+            Object::Stream(stream) => {
+                if matches!(stream.dict.get(b"Type").and_then(Object::as_name).ok(),
+                    Some(b"XRef" | b"ObjStm")) {
+                    // lopdf rewrites these, so old storage containers do not set the minimum.
+                    continue;
+                }
+                &stream.dict
+            }
+            _ => continue,
+        };
+        let subtype = dictionary.get(b"Subtype").and_then(Object::as_name).ok();
+        if subtype == Some(b"Image") {
+            if dictionary.get(b"BitsPerComponent").and_then(Object::as_i64).ok() == Some(16) {
+                required = required.max((1, 5));
+            }
+            if dictionary.has(b"SMask") {
+                required = required.max((1, 4));
+            }
+        }
+        if matches!(subtype, Some(b"Type0" | b"CIDFontType0" | b"CIDFontType2"))
+            || dictionary.has(b"ToUnicode")
+        {
+            required = required.max((1, 2));
+        }
+        if dictionary.has(b"UserUnit") {
+            required = required.max((1, 6));
+        }
+        if dictionary.get(b"Type").and_then(Object::as_name).ok() == Some(b"Metadata") {
+            required = required.max((1, 4));
+        }
+        if let Ok(filter) = dictionary.get(b"Filter") {
+            let (_, filter) = document.dereference(filter)?;
+            let filters = match filter {
+                Object::Array(values) => values.as_slice(),
+                _ => std::slice::from_ref(filter),
+            };
+            for filter in filters {
+                match filter.as_name().ok() {
+                    Some(b"FlateDecode") => required = required.max((1, 2)),
+                    Some(b"JBIG2Decode") => required = required.max((1, 4)),
+                    Some(b"JPXDecode") => required = required.max((1, 5)),
+                    _ => {}
+                }
+            }
+        }
+        pending.extend(dictionary.iter().map(|(_, value)| value));
+    }
+    require_pdf_version(document, required)?;
+    if parse_pdf_version(document.version.as_bytes())? < (1, 5) {
+        document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+    }
+    Ok(())
+}
+
 fn write_page_range(
     source_document: &LopdfDocument,
     output_path: &Path,
     range: PageRange,
 ) -> Result<(), AppError> {
-    let mut output_document = LopdfDocument::with_version(source_document.version.clone());
+    let mut output_document =
+        LopdfDocument::with_version(output_pdf_version(std::iter::once(source_document))?);
     let pages_id = output_document.new_object_id();
     let catalog_id = output_document.new_object_id();
     let mut copied_objects = HashMap::new();
@@ -1820,6 +1925,7 @@ fn write_page_range(
     output_document.trailer.set("Root", catalog_id);
     set_split_trailer_id(source_document, &mut output_document, output_path, range);
     stamp_pdf_metadata(&mut output_document, Some(source_document))?;
+    prepare_pdf_output(&mut output_document)?;
     output_document.save(output_path)?;
     Ok(())
 }
@@ -1875,16 +1981,11 @@ fn write_edited_pdf(
     pages: &[EditPagePlan],
     output_path: &Path,
 ) -> Result<(), AppError> {
-    let version = source_documents
-        .values()
-        .next()
-        .map(|document| document.version.clone())
-        .unwrap_or_else(|| "1.7".to_string());
     let first_source_id = source_documents
         .values()
         .next()
         .and_then(|document| source_trailer_id(document, 0));
-    let mut output_document = LopdfDocument::with_version(version);
+    let mut output_document = LopdfDocument::with_version("1.0");
     let pages_id = output_document.new_object_id();
     let catalog_id = output_document.new_object_id();
     let mut copied_objects_by_source: HashMap<PathBuf, HashMap<ObjectId, ObjectId>> =
@@ -1953,6 +2054,7 @@ fn write_edited_pdf(
     );
     let metadata_source = source_documents.values().next();
     stamp_pdf_metadata(&mut output_document, metadata_source)?;
+    prepare_pdf_output(&mut output_document)?;
     output_document.save(output_path)?;
     Ok(())
 }
@@ -1968,6 +2070,10 @@ fn append_pdf_page(
     paint_edits: &[PagePaintEdit],
 ) -> Result<(), AppError> {
     let source_pages = source_document.get_pages();
+    require_pdf_version(
+        output_document,
+        parse_pdf_version(output_pdf_version([source_document])?.as_bytes())?,
+    )?;
     let source_page_id = *source_pages
         .get(&page_number)
         .ok_or_else(|| AppError::SplitValidation(format!("Page {page_number} not found")))?;
@@ -2033,32 +2139,18 @@ fn append_image_page(
 
     let image =
         image_025::open(image_path).map_err(|error| AppError::Preview(error.to_string()))?;
-    let rgb = image.to_rgb8();
-    let (image_width, image_height) = rgb.dimensions();
-    let (page_width, page_height) = if image_width >= image_height {
-        (842.0_f64, 595.0_f64)
-    } else {
-        (595.0_f64, 842.0_f64)
-    };
+    let (image_width, image_height) = image.dimensions();
+    let (page_width, page_height) = insert::image_page_size(image_path, image_width, image_height);
     let scale = (page_width / f64::from(image_width)).min(page_height / f64::from(image_height));
-    let draw_width = f64::from(image_width) * scale;
-    let draw_height = f64::from(image_height) * scale;
+    let (draw_width, draw_height) =
+        insert::image_physical_size(image_path, image_width, image_height).unwrap_or((
+            f64::from(image_width) * scale,
+            f64::from(image_height) * scale,
+        ));
     let draw_x = (page_width - draw_width) / 2.0;
     let draw_y = (page_height - draw_height) / 2.0;
 
-    let mut image_stream = Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Image",
-            "Width" => image_width as i64,
-            "Height" => image_height as i64,
-            "ColorSpace" => "DeviceRGB",
-            "BitsPerComponent" => 8,
-        },
-        rgb.into_raw(),
-    );
-    image_stream.compress()?;
-    let image_id = output_document.add_object(image_stream);
+    let image_id = insert::append_lossless_image(output_document, &image)?;
 
     let content = format!(
         "q\n{} 0 0 {} {} {} cm\n/Im1 Do\nQ\n",
@@ -3603,6 +3695,7 @@ fn write_page_range_by_deletion(
     range: PageRange,
 ) -> Result<(), AppError> {
     let mut document = LopdfDocument::load(source_path)?;
+    document.version = output_pdf_version(std::iter::once(&document))?;
     let pages_to_delete = (1..=total_pages)
         .filter(|page_number| *page_number < range.start || *page_number > range.end)
         .collect::<Vec<_>>();
@@ -3616,6 +3709,7 @@ fn write_page_range_by_deletion(
 
     set_split_trailer_id(source_document, &mut document, output_path, range);
     stamp_pdf_metadata(&mut document, Some(source_document))?;
+    prepare_pdf_output(&mut document)?;
     document.save(output_path)?;
     Ok(())
 }
@@ -3656,6 +3750,7 @@ fn is_supported_image(path: &Path) -> bool {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(insert::InsertSourceStore::default())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let paths: Vec<String> = args
                 .iter()
@@ -3691,6 +3786,8 @@ pub fn run() {
             read_startup_pdf_path,
             read_startup_pdf_paths,
             read_insert_pages,
+            merge::merge_pdf,
+            merge::read_merge_metadata,
             render_pdf_pages,
             sample_image_color,
             save_pdf_edits,
@@ -3699,8 +3796,13 @@ pub fn run() {
             start_main_window_drag,
             toggle_main_window_maximize
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running MpBPO PDF Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building MpBPO PDF Studio")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<insert::InsertSourceStore>().cleanup();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -3708,6 +3810,68 @@ mod tests {
     use super::*;
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Object, Stream};
+
+    #[test]
+    fn insert_worker_reuses_renderer_for_repeated_batches_and_previews() {
+        let directory = tempfile::tempdir().expect("create insert fixture directory");
+        let first = directory.path().join("first.pdf");
+        let second = directory.path().join("second.pdf");
+        create_smoke_pdf_with_page_count(&first, 2);
+        create_smoke_pdf_with_page_count(&second, 1);
+        let original = fs::read(&first).unwrap();
+        let state = AppState::default();
+        for run in 0..3 {
+            let first_path = first.to_string_lossy().into_owned();
+            let second_path = second.to_string_lossy().into_owned();
+            let stage = directory.path().join("stage");
+            let (sender, receiver) = mpsc::channel();
+            state
+                .inner
+                .renderer
+                .sender
+                .lock()
+                .unwrap()
+                .send(RenderCommand::Insert(Box::new(move |pdfium| {
+                    let sources = insert::InsertSourceStore::default();
+                    let result = insert::read_insert_pages_impl(
+                        vec![first_path, second_path],
+                        format!("repeat-{run}"),
+                        &stage,
+                        |_| {},
+                        |_| Ok(()),
+                        |dir| sources.retain(dir),
+                        pdfium,
+                    );
+                    sender.send(result).unwrap();
+                })))
+                .unwrap();
+            let result = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("insert worker must not deadlock")
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["issues"], serde_json::json!([]));
+            let pages = result["pages"].as_array().unwrap();
+            assert_eq!(pages.len(), 3);
+            assert_eq!(pages[0]["source"]["pageNumber"], 1);
+            assert_eq!(pages[1]["source"]["pageNumber"], 2);
+            assert_eq!(pages[2]["source"]["fileName"], "second.pdf");
+            let previews = render_pdf_pages_impl(
+                &state,
+                first.to_string_lossy().into_owned(),
+                vec![1],
+                175 + run,
+                RenderLane::Thumbnail,
+                None,
+            )
+            .unwrap();
+            assert_eq!(previews.len(), 1);
+            assert!(previews[0].width > 0 && previews[0].height > 0);
+            fs::remove_file(&previews[0].file_path).unwrap();
+        }
+        state.release_render_session().unwrap();
+        assert_eq!(fs::read(&first).unwrap(), original);
+    }
 
     #[test]
     #[ignore = "downloads and binds PDFium on first run"]
@@ -3977,6 +4141,173 @@ mod tests {
                 appended_content_id,
             ],
         );
+    }
+
+
+    #[test]
+    fn output_version_tracks_written_features_without_decoding_pixels() {
+        for (dictionary, expected) in [
+            (dictionary! { "Subtype" => "Image", "BitsPerComponent" => 8 }, "1.0"),
+            (dictionary! { "Subtype" => "Image", "BitsPerComponent" => 16 }, "1.5"),
+            (dictionary! { "Subtype" => "Image", "BitsPerComponent" => 8, "SMask" => (9, 0) }, "1.4"),
+            (dictionary! { "Filter" => "FlateDecode" }, "1.2"),
+            (dictionary! { "Filter" => vec![Object::Name(b"ASCII85Decode".to_vec()), Object::Name(b"FlateDecode".to_vec())] }, "1.2"),
+            (dictionary! { "Filter" => "JPXDecode" }, "1.5"),
+            (dictionary! { "Filter" => "JBIG2Decode" }, "1.4"),
+            (dictionary! { "Subtype" => "Type0", "ToUnicode" => (9, 0) }, "1.2"),
+            (dictionary! { "Type" => "Page", "UserUnit" => 2 }, "1.6"),
+        ] {
+            for original in ["1.0", "1.4", "1.7", "2.0"] {
+                let mut document = LopdfDocument::with_version(original);
+                document.add_object(Stream::new(dictionary.clone(), b"not decodable image data".to_vec()));
+                prepare_pdf_output(&mut document).unwrap();
+                assert_eq!(document.version, original.max(expected));
+                if document.version.as_str() < "1.5" {
+                    assert!(matches!(document.reference_table.cross_reference_type,
+                        lopdf::xref::XrefType::CrossReferenceTable));
+                }
+            }
+        }
+    }
+    #[test]
+    fn output_version_validates_declarations_without_pixel_decoding() {
+        assert_eq!(output_pdf_version(std::iter::empty()).unwrap(), "1.0");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("version.pdf");
+        create_smoke_pdf(&path);
+        let mut document = LopdfDocument::load(&path).unwrap();
+        let version_id = document.add_object(Object::Name(b"2.0".to_vec()));
+        document.catalog_mut().unwrap().set("Version", version_id);
+        assert_eq!(output_pdf_version([&document]).unwrap(), "2.0");
+        document.catalog_mut().unwrap().set("Version", Object::Null);
+        assert_eq!(output_pdf_version([&document]).unwrap(), document.version);
+        for version in ["", "broken", "1.7\n", "0.0", "1.70"] {
+            document
+                .catalog_mut()
+                .unwrap()
+                .set("Version", Object::Name(version.as_bytes().to_vec()));
+            assert!(output_pdf_version([&document]).is_err());
+        }
+        document.catalog_mut().unwrap().remove(b"Version");
+        document.version = "broken".into();
+        assert!(output_pdf_version([&document]).is_err());
+    }
+
+    #[test]
+    fn output_version_split_preserves_header_and_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        for (header, catalog, expected) in [
+            ("1.2", None, "1.2"),
+            ("1.4", None, "1.4"),
+            ("1.4", Some("1.7"), "1.7"),
+            ("1.7", Some("2.0"), "2.0"),
+            ("2.0", Some("1.7"), "2.0"),
+        ] {
+            let source = root.path().join("source.pdf");
+            create_smoke_pdf_with_page_count(&source, 2);
+            let mut document = LopdfDocument::load(&source).unwrap();
+            document.version = header.into();
+            document.reference_table.cross_reference_type =
+                lopdf::xref::XrefType::CrossReferenceTable;
+            if let Some(version) = catalog {
+                document
+                    .catalog_mut()
+                    .unwrap()
+                    .set("Version", Object::Name(version.as_bytes().to_vec()));
+            }
+            document.save(&source).unwrap();
+            let range = PageRange { start: 1, end: 1 };
+            let direct = root.path().join("direct.pdf");
+            write_page_range(&document, &direct, range).unwrap();
+            assert_eq!(
+                LopdfDocument::load(&direct).unwrap().version,
+                expected,
+                "header={header}, catalog={catalog:?}"
+            );
+            let fallback = root.path().join("fallback.pdf");
+            write_page_range_by_deletion(&document, &source, &fallback, 2, range).unwrap();
+            assert_eq!(LopdfDocument::load(&fallback).unwrap().version, expected);
+            if expected < "1.5" {
+                for path in [&direct, &fallback] {
+                    assert!(matches!(
+                        LopdfDocument::load(path).unwrap().reference_table.cross_reference_type,
+                        lopdf::xref::XrefType::CrossReferenceTable
+                    ));
+                }
+            }
+            if let Some(root) = std::env::var_os("PDF_VERSION_TEST_OUTPUT_DIR") {
+                let root = PathBuf::from(root);
+                fs::create_dir_all(&root).unwrap();
+                for (kind, path) in [("direct", &direct), ("fallback", &fallback)] {
+                    fs::copy(
+                        path,
+                        root.join(format!(
+                            "version-{header}-{}-{kind}.pdf",
+                            catalog.unwrap_or("none")
+                        )),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_version_mixed_sources_does_not_depend_on_map_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut plans = Vec::new();
+        for (name, header, catalog) in [("old", "1.2", None), ("new", "1.7", Some("2.0"))] {
+            let path = root.path().join(format!("{name}.pdf"));
+            create_smoke_pdf(&path);
+            let mut document = LopdfDocument::load(&path).unwrap();
+            document.version = header.into();
+            document.reference_table.cross_reference_type =
+                lopdf::xref::XrefType::CrossReferenceTable;
+            if let Some(version) = catalog {
+                document
+                    .catalog_mut()
+                    .unwrap()
+                    .set("Version", Object::Name(version.as_bytes().to_vec()));
+            }
+            document.save(&path).unwrap();
+            plans.push(EditPagePlan {
+                source: PageSource::Pdf {
+                    file_name: format!("{name}.pdf"),
+                    file_path: path.to_string_lossy().into_owned(),
+                    page_number: 1,
+                },
+                rotation: 0,
+                paint_edits: Vec::new(),
+            });
+        }
+        for _ in 0..12 {
+            plans.reverse();
+            let mut sources = load_edit_source_documents(&plans).unwrap();
+            let output = root.path().join("mixed.pdf");
+            write_edited_pdf(&mut sources, &plans, &output).unwrap();
+            let document = LopdfDocument::load(&output).unwrap();
+            assert_eq!(document.version, "2.0");
+            assert_eq!(document.get_pages().len(), 2);
+            let old_page = plans.iter().find(|plan| matches!(
+                &plan.source, PageSource::Pdf { file_name, .. } if file_name == "old.pdf"
+            )).unwrap();
+            let subset = root.path().join("old-only.pdf");
+            write_edited_pdf(&mut sources, std::slice::from_ref(old_page), &subset).unwrap();
+            assert_eq!(LopdfDocument::load(&subset).unwrap().version, "1.2");
+            if let Some(root) = std::env::var_os("PDF_VERSION_TEST_OUTPUT_DIR") {
+                let root = PathBuf::from(root);
+                fs::create_dir_all(&root).unwrap();
+                fs::copy(&output, root.join("mixed-2.0.pdf")).unwrap();
+            }
+            assert_eq!(
+                document
+                    .extract_text(&[1, 2])
+                    .unwrap()
+                    .matches("SplitPDF page 1")
+                    .count(),
+                2
+            );
+        }
     }
 
     #[test]

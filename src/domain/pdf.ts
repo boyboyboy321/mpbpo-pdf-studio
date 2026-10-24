@@ -151,6 +151,29 @@ export interface InsertPageMetadata {
   source: PdfPageSource;
 }
 
+export interface InsertIssue {
+  filePath: string;
+  fileName: string;
+  pageNumber: number | null;
+  message: string;
+}
+
+export interface InsertProgressEvent {
+  runId: string;
+  phase: "scanning" | "preparing" | "complete";
+  completedFiles: number;
+  totalFiles: number;
+  currentFileName: string;
+  completedPages: number;
+  totalPages: number | null;
+  issues: InsertIssue[];
+}
+
+export interface InsertBatchResult {
+  pages: InsertPageMetadata[];
+  issues: InsertIssue[];
+}
+
 export interface RecentFile {
   id: string;
   filePath: string;

@@ -1,4 +1,4 @@
-import { FileImage, FilePenLine, Files, Folder, Plus, Search, Upload } from "lucide-react";
+import { FileImage, FilePenLine, Files, Folder, Merge, Plus, Search, Upload } from "lucide-react";
 import { useState } from "react";
 
 import type { PdfLoadState, RecentFile, ToolItem } from "../domain/pdf";
@@ -11,14 +11,16 @@ interface HomeViewProps {
   onOpenDemo: () => void;
   onOpenRecent: (path: string) => void;
   onPickPdf: () => void;
+  onMerge: () => void;
 }
 
 const toolIcons: Record<ToolItem["id"], typeof Files> = {
   split: Files,
   edit: FilePenLine,
+  merge: Merge,
 };
 
-export function HomeView({ isFileDragging, loadState, recentFiles, onOpenDemo, onOpenRecent, onPickPdf }: HomeViewProps) {
+export function HomeView({ isFileDragging, loadState, recentFiles, onOpenDemo, onOpenRecent, onPickPdf, onMerge }: HomeViewProps) {
   const [query, setQuery] = useState("");
 
   const filteredRecent = recentFiles.filter((file) => file.fileName.toLowerCase().includes(query.toLowerCase()));
@@ -47,7 +49,7 @@ export function HomeView({ isFileDragging, loadState, recentFiles, onOpenDemo, o
               {tools.map((tool) => {
                 const Icon = toolIcons[tool.id] ?? FileImage;
                 return (
-                  <button className="tool-card" type="button" key={tool.id}>
+                  <button className="tool-card" type="button" key={tool.id} onClick={tool.id === "merge" ? onMerge : undefined}>
                     <span className={`tool-icon tone-${tool.tone}`}>
                       <Icon size={20} />
                     </span>

@@ -1,6 +1,6 @@
 [package]
 name = "splitpdf_studio"
-version = "0.2.9"
+version = "0.2.10"
 description = "A local-first PDF split and edit desktop app"
 authors = ["MpBPO PDF Studio"]
 edition = "2021"
@@ -14,10 +14,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+flate2 = "1"
 image_025 = { package = "image", version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 lopdf = "0.44.0"
 pdfium-auto = "0.3.0"
 pdfium-render = "0.8.37"
+png = "0.18"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,4 +29,10 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = "2.4.3"
 tauri-plugin-updater = "2.10.1"
 thiserror = "2"
+tiff = "0.11.3"
+tempfile = "3"
 ttf-parser = "0.25"
+zune-jpeg = "0.5.15"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_Foundation"] }

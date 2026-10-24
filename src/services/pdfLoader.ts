@@ -1,8 +1,10 @@
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
-  InsertPageMetadata,
+  InsertBatchResult,
+  InsertProgressEvent,
   PdfDocument,
   PdfMetadata,
   PdfPage,
@@ -45,7 +47,7 @@ export async function pickInsertFilePaths(): Promise<string[]> {
   const selected = await open({
     multiple: true,
     title: "Insert PDF or image",
-    filters: [{ name: "PDF or image", extensions: ["pdf", "png", "jpg", "jpeg"] }],
+    filters: [{ name: "PDF or image", extensions: ["pdf", "png", "jpg", "jpeg", "tif", "tiff"] }],
   });
 
   if (typeof selected === "string") {
@@ -211,13 +213,31 @@ export async function splitPdfDocument(
   });
 }
 
-export async function readInsertPages(paths: string[]): Promise<InsertPageMetadata[]> {
+export async function readInsertPages(
+  paths: string[],
+  runId: string,
+  onProgress: (progress: InsertProgressEvent) => void,
+): Promise<InsertBatchResult> {
   if (paths.length === 0) {
-    return [];
+    return { pages: [], issues: [] };
   }
 
-  const pages = await invoke<Array<{ source: unknown }>>("read_insert_pages", { paths });
-  return pages.map((page) => ({ source: normalizePageSource(page.source) }));
+  let acceptingProgress = true;
+  const unlisten = await listen<InsertProgressEvent>("insert-progress", ({ payload }) => {
+    if (acceptingProgress && payload.runId === runId) {
+      onProgress(payload);
+    }
+  });
+  try {
+    const result = await invoke<InsertBatchResult>("read_insert_pages", { paths, runId });
+    return {
+      issues: result.issues,
+      pages: result.issues.length > 0 ? [] : result.pages.map((page) => ({ source: normalizePageSource(page.source) })),
+    };
+  } finally {
+    acceptingProgress = false;
+    await Promise.resolve(unlisten()).catch((error: unknown) => console.warn("Could not remove insert progress listener", error));
+  }
 }
 
 export async function savePdfEdits(document: PdfDocument): Promise<PdfMetadata> {

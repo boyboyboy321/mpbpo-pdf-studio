@@ -646,12 +646,16 @@ button:disabled {
 .editor-shell {
   display: grid;
   height: 100%;
+  min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: 44px minmax(0, 1fr);
   overflow: hidden;
 }
 
 .editor-topbar {
+  min-width: 0;
+  min-height: 44px;
   justify-content: flex-end;
   gap: 12px;
   padding: 0 18px;
@@ -669,9 +673,60 @@ button:disabled {
 
 .document-title.is-compact {
   flex: 1;
-  justify-content: flex-end;
+  flex-direction: row;
+  justify-content: center;
   align-items: center;
-  min-width: 160px;
+  gap: 12px;
+  min-width: 0;
+}
+
+.document-summary { flex: 0 0 auto; max-width: 40%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.insert-status {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  gap: 6px;
+  min-width: 0;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.insert-status-message {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.insert-status-message svg { flex-shrink: 0; }
+.insert-status-text, .insert-current-file, .insert-failed-files { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insert-current-file, .insert-failed-files { flex: 0 1 auto; }
+.insert-status.is-running .insert-status-message { color: var(--blue); }
+.insert-status.is-success .insert-status-message { color: #147d43; }
+.insert-status.is-error .insert-status-message, .document-title .insert-failed-files { color: #b8293a; }
+.document-title .insert-status-text { color: inherit; }
+.insert-status-dismiss, .insert-status-details { display: grid; place-items: center; flex: 0 0 24px; width: 24px; height: 24px; padding: 0; border-radius: 4px; background: transparent; border: 0; color: var(--muted); }
+.insert-status-details { color: #b8293a; }
+.insert-status-dismiss:hover, .insert-status-details:hover { background: var(--surface-soft); }
+.insert-error-details { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 18px; margin: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: 0 22px 58px rgba(20, 22, 26, 0.24); overflow-y: auto; }
+.insert-error-details::backdrop { background: rgba(20, 22, 26, 0.25); }
+.insert-error-details > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.insert-error-details h2 { margin: 0; font-size: 16px; }
+.insert-error-details p { margin: 10px 0; color: var(--muted); font-size: 13px; }
+.insert-issues { max-height: min(360px, 50dvh); overflow-y: auto; margin: 12px 0 0; padding: 0; list-style: none; user-select: text; -webkit-user-select: text; }
+.insert-issues li { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.document-title .insert-issues strong { max-width: none; white-space: normal; }
+.insert-issues strong { color: #b8293a; }
+.insert-error-details .insert-error-message { overflow-wrap: anywhere; color: #b8293a; }
+.insert-spinner { animation: insert-spin 1s linear infinite; }
+@keyframes insert-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .insert-spinner { animation: none; } }
+@media (max-width: 700px) {
+  .insert-status-message { flex-shrink: 1; }
+  .insert-current-file, .insert-failed-files { flex-basis: 0; flex-grow: 1; }
 }
 
 .document-title strong {
@@ -2385,6 +2440,43 @@ button:disabled {
   background: #11a25d;
 }
 
+.detail-paint-toolbar .detail-crop-actions {
+  display: grid;
+  gap: 4px;
+}
+
+.detail-paint-toolbar .detail-crop-actions button.is-cancel {
+  color: #ffffff;
+  background: #dc3545;
+}
+
+.detail-paint-toolbar .detail-crop-actions button.is-cancel:hover {
+  background: #bd2130;
+}
+
+.detail-paint-toolbar .detail-crop-actions.is-crop-attention button {
+  animation: detail-crop-action-shake 360ms ease-in-out;
+}
+
+@keyframes detail-crop-action-shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-4px); }
+  40%, 80% { transform: translateX(4px); }
+}
+
+@keyframes detail-crop-action-highlight {
+  0%, 100% { outline-color: transparent; }
+  50% { outline-color: #ffffff; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detail-paint-toolbar .detail-crop-actions.is-crop-attention button {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    animation: detail-crop-action-highlight 360ms ease-in-out;
+  }
+}
+
 .detail-paint-toolbar button:disabled {
   cursor: not-allowed;
   opacity: 0.35;
@@ -3182,7 +3274,6 @@ button:disabled {
     display: none;
   }
 
-  .editor-topbar,
   .workspace-toolbar {
     flex-wrap: wrap;
     height: auto;

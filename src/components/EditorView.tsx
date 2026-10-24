@@ -84,6 +84,8 @@ import type { DocumentAction } from "../state/documentReducer";
 import { formatBytes } from "../utils/format";
 
 import { PageGrid } from "./PageGrid";
+import { InsertStatus } from "./InsertStatus";
+import type { InsertState } from "./InsertStatus";
 
 interface EditorViewProps {
   busyJob: EditorFileWriteJob | null;
@@ -101,7 +103,7 @@ interface EditorViewProps {
 interface EditorFileWriteJob {
   fileName: string;
   id: string;
-  kind: "save" | "split";
+  kind: "save" | "split" | "insert" | "merge";
   tabId: string;
 }
 
@@ -283,6 +285,13 @@ export function EditorView({
   const [pageScrollTarget, setPageScrollTarget] = useState<number | null>(null);
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
   const [splitState, setSplitState] = useState<SplitState>({ status: "idle" });
+  const [insertState, setInsertState] = useState<InsertState>({ status: "idle" });
+  const insertRunningRef = useRef(false);
+  const insertRunning = insertState.status === "running";
+
+  useEffect(() => {
+    setInsertState({ status: "idle" });
+  }, [document.id]);
 
   const renderQuality = useMemo(
     () => getRenderQualitySettings(document.renderQualityPreset, document.customRenderQuality),
@@ -300,7 +309,7 @@ export function EditorView({
   const isEachPageSplit = totalPossibleCuts > 0 && sortedCuts.length === totalPossibleCuts;
   const isPartialEachPageSplit = sortedCuts.length > 0 && !isEachPageSplit;
   const canSplit = Boolean(document.filePath) && sortedCuts.length > 0 && splitState.status !== "running" && !busyJob;
-  const fileWriteRunning = Boolean(busyJob) || saveState.status === "running" || splitState.status === "running";
+  const fileWriteRunning = Boolean(busyJob) || insertRunning || saveState.status === "running" || splitState.status === "running";
   const splitOutputOption = getSplitOutputOption(document.splitOutputMode);
   const splitOutputDescription =
     document.splitOutputMode === "customFolder" && document.splitCustomOutputFolder
@@ -995,6 +1004,10 @@ export function EditorView({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (insertRunningRef.current) {
+        if ((event.ctrlKey || event.metaKey) || event.key === "Delete" || event.code === "Space") event.preventDefault();
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
         event.preventDefault();
         void saveCurrentDocument();
@@ -1062,22 +1075,42 @@ export function EditorView({
   }
 
   async function handleInsertPages() {
+    if (insertRunningRef.current || busyJob) return;
     if (!document.filePath) {
       setSaveState({ status: "error", message: "Open a real PDF before inserting pages." });
       return;
     }
 
+    insertRunningRef.current = true;
+    let runId: string | null = null;
     try {
       const paths = await pickInsertFilePaths();
       if (paths.length === 0) {
         return;
       }
 
-      const pages = await readInsertPages(paths);
-      dispatch({ type: "insert-pages-after-selection", pages });
+      runId = createSplitRunId();
+      if (!onBeginBusyJob({ fileName: document.fileName, id: runId, kind: "insert", tabId })) {
+        setInsertState({ status: "error", issues: [], message: "Another operation is in progress. Please try again after it finishes." });
+        return;
+      }
+      setInsertState({ status: "running", progress: {
+        runId, phase: "scanning", completedFiles: 0, totalFiles: paths.length,
+        currentFileName: "", completedPages: 0, totalPages: null, issues: [],
+      } });
       setSaveState({ status: "idle" });
+      const result = await readInsertPages(paths, runId, (progress) => setInsertState({ status: "running", progress }));
+      if (result.issues.length > 0) {
+        setInsertState({ status: "error", issues: result.issues });
+        return;
+      }
+      dispatch({ type: "insert-pages-after-selection", pages: result.pages });
+      setInsertState({ status: "success", pageCount: result.pages.length });
     } catch (error: unknown) {
-      setSaveState({ status: "error", message: getFriendlyLoadError(error) });
+      setInsertState((current) => ({ status: "error", issues: current.status === "running" ? current.progress.issues : [], message: getFriendlyLoadError(error) }));
+    } finally {
+      insertRunningRef.current = false;
+      if (runId) onEndBusyJob(runId);
     }
   }
 
@@ -1217,15 +1250,16 @@ export function EditorView({
     <main className="editor-shell">
       <header className="editor-topbar">
         <div className="document-title is-compact">
-          <span>
+          <span className="document-summary">
             {document.pages.length} pages - {formatBytes(document.sizeBytes)}
             {document.selectedPages.size > 1 ? ` - ${document.selectedPages.size} selected` : null}
             {saveState.status === "error" ? ` - ${saveState.message}` : null}
             {saveState.status === "success" ? " - Saved" : null}
           </span>
+          <InsertStatus state={insertState} onDismiss={() => setInsertState({ status: "idle" })} />
         </div>
         <div className="topbar-actions">
-          <button className="soft-button" type="button" onClick={handlePickPdf}>
+          <button className="soft-button" type="button" disabled={insertRunning} onClick={handlePickPdf}>
             <FolderOpen size={18} />
             Open
           </button>
@@ -1236,7 +1270,7 @@ export function EditorView({
         </div>
       </header>
 
-      <div className={`editor-layout ${document.detailPanelVisible ? "" : "is-detail-collapsed"}`}>
+      <div className={`editor-layout ${document.detailPanelVisible ? "" : "is-detail-collapsed"}`} inert={insertRunning}>
         <aside className="tool-rail" aria-label="PDF tools">
           <button className="rail-tool is-active" type="button" aria-label="Select pages">
             <MousePointer2 size={19} />
@@ -1255,7 +1289,7 @@ export function EditorView({
           <button className="rail-tool" type="button" aria-label="Rotate right" title="Rotate selected right (Ctrl+R)" onClick={() => handleRotateSelected(90)}>
             <RotateCw size={19} />
           </button>
-          <button className="rail-tool" type="button" aria-label="Insert pages" title="Insert pages" onClick={() => void handleInsertPages()}>
+          <button className="rail-tool" type="button" disabled={Boolean(busyJob) || insertRunning} aria-label="Insert pages" title="Insert pages" onClick={() => void handleInsertPages()}>
             <FilePlus2 size={19} />
           </button>
           <button
@@ -1995,7 +2029,7 @@ function createSplitRunId(): string {
 }
 
 function getBusyJobMessage(job: EditorFileWriteJob, requestedKind: "save" | "split"): string {
-  const runningAction = job.kind === "split" ? "splitting" : "saving";
+  const runningAction = job.kind === "merge" ? "merging" : job.kind === "insert" ? "inserting pages" : job.kind === "split" ? "splitting" : "saving";
   const requestedAction = requestedKind === "split" ? "split another PDF" : "save another PDF";
   return `${job.fileName} is ${runningAction}. Please wait before you ${requestedAction}.`;
 }
@@ -2328,6 +2362,7 @@ function FullPreviewOverlay({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [draftCover, setDraftCover] = useState<DraftCoverRect | null>(null);
   const [draftCrop, setDraftCrop] = useState<DraftCoverRect | null>(null);
+  const cropActionsRef = useRef<HTMLDivElement | null>(null);
   const [draftTextRect, setDraftTextRect] = useState<DraftCoverRect | null>(null);
   const [activeTextEditId, setActiveTextEditId] = useState<string | null>(null);
   const [straightenInput, setStraightenInput] = useState("");
@@ -2471,8 +2506,17 @@ function FullPreviewOverlay({
       const key = event.key.toLowerCase();
       const isTyping = isTypingTarget(event.target);
 
+      if (tool === "crop" && event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelPendingCrop();
+        setPageInput(currentPageText);
+        return;
+      }
+
       if (!isTyping && event.key === "Escape") {
         event.preventDefault();
+        if (event.repeat) return;
         if (activeTextEdit) {
           finishActiveTextEdit();
           return;
@@ -2509,7 +2553,7 @@ function FullPreviewOverlay({
 
       if ((event.ctrlKey || event.metaKey) && key === "r") {
         event.preventDefault();
-        onRotateClockwise(state.page.pageNumber);
+        rotatePreviewPage();
         return;
       }
 
@@ -2545,8 +2589,7 @@ function FullPreviewOverlay({
 
       if ((event.ctrlKey || event.metaKey) && key === "z") {
         event.preventDefault();
-        onUndoPaintEdit(state.page.pageNumber);
-        setActiveTextEditId(null);
+        undoPaintEdit();
         return;
       }
 
@@ -2612,14 +2655,54 @@ function FullPreviewOverlay({
   }
 
   function chooseTool(nextTool: DetailTool) {
+    if (tool === "crop") {
+      if (nextTool !== "crop") nudgeCropActions();
+      return;
+    }
     discardActiveEmptyTextEdit();
     setDraftCrop(nextTool === "crop" ? activeCrop : null);
     setTool(nextTool);
   }
 
   function closePreview() {
+    if (tool === "crop") {
+      nudgeCropActions();
+      return;
+    }
     discardActiveEmptyTextEdit();
     onClose();
+  }
+
+  function nudgeCropActions() {
+    const actions = cropActionsRef.current;
+    if (!actions) return;
+    actions.classList.remove("is-crop-attention");
+    // Restart both button animations, including on repeated outside clicks.
+    void actions.offsetWidth;
+    actions.classList.add("is-crop-attention");
+  }
+
+  function cancelPendingCrop() {
+    pointerStateRef.current = null;
+    setDraftCrop(null);
+    setTool("hand");
+  }
+
+  function rotatePreviewPage() {
+    if (tool === "crop") {
+      nudgeCropActions();
+      return;
+    }
+    onRotateClockwise(state.page.pageNumber);
+  }
+
+  function undoPaintEdit() {
+    if (tool === "crop") {
+      nudgeCropActions();
+      return;
+    }
+    onUndoPaintEdit(state.page.pageNumber);
+    setActiveTextEditId(null);
   }
 
   function updateTextStyle(patch: Partial<DetailTextStyle>) {
@@ -2681,8 +2764,7 @@ function FullPreviewOverlay({
   function commitPendingCrop() {
     const nextCrop = clampCropRect(draftCrop ?? activeCrop);
     commitCropEdit(nextCrop);
-    setDraftCrop(null);
-    setTool("hand");
+    cancelPendingCrop();
   }
 
   function addStraightenDegrees(delta: number) {
@@ -2726,6 +2808,11 @@ function FullPreviewOverlay({
   }
 
   function goToPage(pageNumber: number, options: FullPreviewPageChangeOptions = {}) {
+    if (tool === "crop") {
+      setPageInput(currentPageText);
+      nudgeCropActions();
+      return;
+    }
     discardActiveEmptyTextEdit();
     setActiveTextEditId(null);
     onPageChange(pageNumber, options);
@@ -3044,6 +3131,10 @@ function FullPreviewOverlay({
   }
 
   async function handlePickCoverColor() {
+    if (tool === "crop") {
+      nudgeCropActions();
+      return;
+    }
     if (colorPickerAbortRef.current) return;
     const EyeDropper = (window as EyeDropperWindow).EyeDropper;
     if (!EyeDropper) {
@@ -3211,9 +3302,14 @@ function FullPreviewOverlay({
         <Crop size={18} />
       </button>
       {tool === "crop" ? (
-        <button className="is-confirm" type="button" aria-label="Apply crop" title="Done crop (Enter)" onClick={commitPendingCrop}>
-          <Check size={18} />
-        </button>
+        <div className="detail-crop-actions" ref={cropActionsRef}>
+          <button className="is-confirm" type="button" aria-label="Apply crop" title="Apply crop (Enter)" onClick={commitPendingCrop}>
+            <Check size={18} />
+          </button>
+          <button className="is-cancel" type="button" aria-label="Cancel crop" title="Cancel crop (Esc)" onClick={cancelPendingCrop}>
+            <X size={18} />
+          </button>
+        </div>
       ) : null}
       <button
         className={tool === "straighten" ? "is-active" : ""}
@@ -3234,7 +3330,7 @@ function FullPreviewOverlay({
       >
         <Scissors size={18} />
       </button>
-      <button type="button" aria-label="Undo last paint edit" title="Undo (Ctrl+Z)" disabled={!canUndoPaint} onClick={() => onUndoPaintEdit(state.page.pageNumber)}>
+      <button type="button" aria-label="Undo last paint edit" title="Undo (Ctrl+Z)" disabled={!canUndoPaint} onClick={undoPaintEdit}>
         <Undo2 size={18} />
       </button>
     </div>
@@ -3448,7 +3544,7 @@ function FullPreviewOverlay({
           </button>
           <span>of {pageCount}</span>
           <i aria-hidden="true" />
-          <button type="button" aria-label="Rotate page right" onClick={() => onRotateClockwise(state.page.pageNumber)}>
+          <button type="button" aria-label="Rotate page right" onClick={rotatePreviewPage}>
             <RotateCw size={18} />
           </button>
           <button type="button" aria-label="Close preview" onClick={closePreview}>

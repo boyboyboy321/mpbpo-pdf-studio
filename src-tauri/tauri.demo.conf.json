@@ -1,0 +1,7 @@
+{
+  "identifier": "com.splitpdf.studio.demo",
+  "build": {
+    "beforeDevCommand": "pnpm.cmd dev --port 5190 --strictPort",
+    "devUrl": "http://127.0.0.1:5190"
+  }
+}
