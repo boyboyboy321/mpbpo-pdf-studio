@@ -2496,6 +2496,7 @@ function FullPreviewOverlay({
 
   useEffect(() => {
     const handlePreviewKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof Element && event.target.closest("[data-release-notes-dialog]")) return;
       if (colorPickerAbortRef.current) {
         if (event.key === "Escape") {
           event.preventDefault();

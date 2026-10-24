@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorView } from "./components/EditorView";
 import { HomeView } from "./components/HomeView";
 import { MergeDialog } from "./components/MergeDialog";
+import { ReleaseNotesButton } from "./components/ReleaseNotesButton";
 import type { PdfDocument, PdfLoadState } from "./domain/pdf";
 import { APP_VERSION, getPolicyBlockMessage, loadAppPolicy } from "./services/appPolicy";
 import { saveEditorPreferences } from "./services/editorPreferences";
@@ -115,7 +116,7 @@ export function App() {
       if (event.key !== "Tab") {
         return;
       }
-      if (event.target instanceof Element && event.target.closest("[data-merge-dialog]")) return;
+      if (event.target instanceof Element && event.target.closest("[data-merge-dialog], [data-release-notes-dialog]")) return;
 
       event.preventDefault();
 
@@ -1260,6 +1261,7 @@ function AppTitleBar({ forceClose = false, onRequestClose }: { forceClose?: bool
         </div>
       </div>
       <div className="app-titlebar-actions">
+        <ReleaseNotesButton />
         <span
           className="window-control-group"
           aria-label="Window controls"

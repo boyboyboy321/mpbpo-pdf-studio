@@ -1,0 +1,119 @@
+.release-notes-trigger {
+  width: 32px;
+  height: 30px;
+  flex: 0 0 32px;
+  margin: 0 8px 0 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #596271;
+}
+
+.release-notes-trigger:hover,
+.release-notes-close:hover {
+  color: #14161a;
+  background: #e5e7eb;
+}
+
+.release-notes-trigger:focus-visible,
+.release-notes-close:focus-visible,
+.release-notes-body:focus-visible {
+  outline: 2px solid #0b57ff;
+  outline-offset: -2px;
+}
+
+.release-notes-dialog {
+  width: min(600px, calc(100vw - 32px));
+  max-width: none;
+  max-height: min(680px, calc(100vh - 48px));
+  margin: auto;
+  padding: 0;
+  border: 1px solid #dde1e8;
+  border-radius: 8px;
+  background: #fff;
+  color: #14161a;
+  box-shadow: 0 18px 46px rgb(21 31 54 / 18%);
+  overflow: hidden;
+}
+
+.release-notes-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.release-notes-dialog::backdrop {
+  background: rgb(20 22 26 / 35%);
+}
+
+.release-notes-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex: 0 0 auto;
+  padding: 20px 20px 16px 24px;
+  border-bottom: 1px solid #dde1e8;
+}
+
+.release-notes-header h2 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.4;
+}
+
+.release-notes-header p {
+  margin: 5px 0 0;
+  font-size: 13px;
+  color: #687080;
+  overflow-wrap: anywhere;
+}
+
+.release-notes-close {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #687080;
+}
+
+.release-notes-body {
+  min-height: 0;
+  padding: 20px 24px 24px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.release-notes-body ::selection {
+  background: #eaf1ff;
+}
+
+.release-notes-body section + section {
+  margin-top: 22px;
+}
+
+.release-notes-body h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.release-notes-body ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.release-notes-body li + li {
+  margin-top: 8px;
+}
